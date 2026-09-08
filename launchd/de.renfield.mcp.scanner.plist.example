@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  LaunchAgent for the scanner MCP server.
+
+  A LaunchAgent, NOT a LaunchDaemon: USB access via libusb wants the user
+  session, and a root daemon with no session risks the OS's device
+  restrictions. The trade-off, accepted deliberately: the server runs only
+  while the operator is logged in. Staged scans are durable on disk, so a
+  logout or reboot delays a push, it never loses one.
+
+  Install:
+    cp de.renfield.mcp.scanner.plist.example \
+       ~/Library/LaunchAgents/de.renfield.mcp.scanner.plist
+    # edit the paths and target tokens, then:
+    launchctl load ~/Library/LaunchAgents/de.renfield.mcp.scanner.plist
+
+  Tokens: prefer piping them in from the Keychain via a wrapper script rather
+  than writing them into this file. A plist is world-readable.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>de.renfield.mcp.scanner</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/CHANGE/ME/renfield-mcp-scanner/.venv/bin/renfield-mcp-scanner</string>
+  </array>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <!-- scanimage lives in the Homebrew prefix; launchd's PATH is minimal. -->
+    <key>PATH</key><string>/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <key>SCANNER_TARGETS_YAML</key><string>/CHANGE/ME/targets.yaml</string>
+    <key>SCANNER_STAGING_DIR</key><string>~/.renfield-scanner/staging</string>
+    <!-- Bind to the LAN interface only when target clusters must reach it. -->
+    <key>SCANNER_MCP_HOST</key><string>127.0.0.1</string>
+    <key>SCANNER_MCP_PORT</key><string>9093</string>
+    <key>SCANNER_LOG_LEVEL</key><string>INFO</string>
+    <!-- One per target, named by that target's token_env. -->
+    <!-- <key>SCANNER_TOKEN_PRIMARY</key><string>...</string> -->
+  </dict>
+
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>StandardOutPath</key><string>/tmp/renfield-mcp-scanner.log</string>
+  <key>StandardErrorPath</key><string>/tmp/renfield-mcp-scanner.log</string>
+</dict>
+</plist>

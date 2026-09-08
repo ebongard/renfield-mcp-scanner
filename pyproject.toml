@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "renfield-mcp-scanner"
+version = "0.1.0"
+description = "USB document scanner MCP server — scans, corrects, routes and pushes into Renfield"
+requires-python = ">=3.11"
+license = {text = "MIT"}
+dependencies = [
+    # The <2 pin is LOAD-BEARING: mcp v2 renames FastMCP -> MCPServer and the
+    # import in server.py dies. Same pin as every sibling renfield-mcp-*.
+    "mcp>=1.26.0,<2",
+    "httpx>=0.27.0",
+    "pydantic>=2.0",
+    "pyyaml>=6.0",
+    # Image correction (white balance, show-through, DPI). NOT optional: the
+    # scanner's raw output is unusable without it — see pipeline.py.
+    "pillow>=10.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0", "pytest-asyncio>=0.24"]
+# Phase 2 — barcode separator sheets. Optional so Phase 1 installs without zbar.
+barcode = ["pyzbar>=0.1.9"]
+
+[project.scripts]
+renfield-mcp-scanner = "renfield_mcp_scanner.server:main"
+renfield-mcp-scanner-scan = "renfield_mcp_scanner.scan:main"
+
+[tool.setuptools.packages.find]
+include = ["renfield_mcp_scanner*"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"

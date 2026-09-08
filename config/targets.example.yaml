@@ -1,0 +1,30 @@
+# Scanner routing registry — 1..n targets. Adding one is config, never code.
+#
+# Copy to a real file, point SCANNER_TARGETS_YAML at it, and keep the real one
+# out of git if the target names are sensitive.
+#
+# NO TOKENS HERE. `token_env` names the environment variable holding that
+# target's folder-ingest Bearer token; it is resolved at push time and the
+# server refuses (naming the variable) if it is unset.
+#
+# With exactly ONE target the entire routing layer short-circuits: no
+# classifier, no separator decoding, no review queue.
+
+targets:
+  - id: primary
+    label: Primary instance
+    # The only text the Phase 3 classifier is given about this target.
+    description: >-
+      Correspondence addressed to the primary account holder.
+    base_url: http://renfield-backend:8000
+    token_env: SCANNER_TOKEN_PRIMARY
+    scan_profile_id: default
+    separator_payload: PRIMARY
+
+  # - id: second
+  #   label: Second instance
+  #   description: Correspondence addressed to the second account holder.
+  #   base_url: http://other-backend:8000
+  #   token_env: SCANNER_TOKEN_SECOND
+  #   scan_profile_id: default
+  #   separator_payload: SECOND
