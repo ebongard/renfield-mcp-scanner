@@ -63,6 +63,11 @@ async def scan_document(target: str = "", title: str = "") -> dict:
     configured. With exactly one configured target it is chosen automatically.
     If the destination cannot be settled the scan is kept safely on the scanner
     host and waits for a routing decision — it is never filed into a guess.
+
+    The result's `renfield_document_id` is the id IN RENFIELD. It is NOT a
+    Paperless id: filing into Paperless runs asynchronously afterwards, gets its
+    own separate id, and that id is not known when this returns. Do not report
+    it as a Paperless id, and do not claim the document is in Paperless yet.
     """
     config, staging = _ctx()
     return await t.scan_document(config, staging, assemble, target=target, title=title)

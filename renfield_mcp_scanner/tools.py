@@ -121,10 +121,19 @@ async def scan_document(
         staging.keep(stage_dir, reason=outcome.status or outcome.detail,
                      detail=outcome.detail, target=routing.target.id)
 
+    # The id is NAMED for its system on purpose. It was returned as a bare
+    # `document_id`, and the agent — surrounded by Paperless tooling in the
+    # documents role — told the user "die Dokument-ID in Paperless ist 426".
+    # It was the RENFIELD id, and the document was not in Paperless at all yet.
+    # An unqualified id in a tool result is an invitation to mislabel it.
     return {"ok": outcome.action is StageAction.DISCARD, "routed": True,
             "target": routing.target.id, "routing_layer": routing.layer,
             "pages": len(result.pages), "status": outcome.status,
-            "document_id": outcome.document_id,
+            "renfield_document_id": outcome.document_id,
+            "paperless_document_id": None,
+            "paperless_note": ("Filing into Paperless happens asynchronously "
+                               "afterwards and has its own separate id; it is "
+                               "not known at scan time."),
             "fatal": outcome.fatal, "detail": outcome.detail,
             "stage_id": None if outcome.action is StageAction.DISCARD else stage_dir.name}
 
@@ -183,7 +192,9 @@ async def retry_pending_scans(config: Config, staging, stage_id: str = "") -> di
                          detail=outcome.detail, target=target_id)
         results.append({
             "stage_id": entry["stage_id"], "target": target_id,
-            "status": outcome.status, "document_id": outcome.document_id,
+            "status": outcome.status,
+            # Named for its system, same reason as in scan_document.
+            "renfield_document_id": outcome.document_id,
             "resolved": outcome.action is StageAction.DISCARD,
             "detail": outcome.detail,
         })

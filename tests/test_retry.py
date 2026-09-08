@@ -6,6 +6,7 @@ forever", so this is the recovery leg of that contract — and it must refuse to
 retry a scan that has no destination, because pushing one somewhere would be
 exactly the guess the design forbids.
 """
+import pathlib
 import pytest
 
 from renfield_mcp_scanner.config import Config, ScanTarget
@@ -49,7 +50,7 @@ async def test_retry_pushes_and_clears_the_stage(tmp_path, monkeypatch):
     out = await retry_pending_scans(_cfg(tmp_path, "files"), st)
     assert out["retried"] == 1
     assert out["results"][0]["resolved"] is True
-    assert out["results"][0]["document_id"] == 99
+    assert out["results"][0]["renfield_document_id"] == 99
     assert not stage.exists()
 
 
@@ -119,3 +120,14 @@ async def test_a_failed_retry_keeps_the_scan(tmp_path, monkeypatch):
     assert stage.exists()
     # and the target survives the re-keep, so it stays retryable
     assert st.pending()[0]["target"] == "files"
+
+
+async def test_scan_result_names_the_id_system(tmp_path, monkeypatch):
+    """An unqualified `document_id` got reported to the user as a Paperless id
+    when it was the Renfield one — and the document was not in Paperless at all
+    yet. The result must say which system each id belongs to."""
+    import renfield_mcp_scanner.tools as T
+    src = pathlib.Path(T.__file__).read_text()
+    assert '"renfield_document_id"' in src
+    assert '"document_id":' not in src, "bare document_id invites mislabelling"
+    assert "paperless" in src.lower()
