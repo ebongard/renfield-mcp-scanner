@@ -41,6 +41,7 @@ review floor) attach at marked points in `router.py`.
 | `scanner_status` | Real hardware state from the SANE sensors — never inferred |
 | `scan_document` | Scan the feeder, correct, route, push |
 | `list_pending_scans` | Scans held here awaiting a decision or a retry |
+| `retry_pending_scans` | Re-send scans kept after a failed push |
 
 ## Install (macOS operator host)
 
@@ -55,6 +56,16 @@ unreachable or a token is unset, so a launch script can gate on it.
 
 **The vendor scanner software must not be running or in Login Items.** It claims
 the USB device exclusively, which blocks this server entirely.
+
+## TLS to a self-hosted backend
+
+A self-hosted Renfield often serves a private or self-signed certificate. `curl`
+may accept it from the OS trust store while Python does **not** (httpx verifies
+against certifi), so a push fails with `CERTIFICATE_VERIFY_FAILED` even though
+the same URL works fine in a shell. Point the target's `ca_bundle` at the PEM.
+
+Verification is never disabled — an unverified push would send documents to
+whatever answers the hostname.
 
 ## Scan quality
 

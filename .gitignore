@@ -13,3 +13,7 @@ staging/
 # specific deployment. Only config/targets.example.yaml is public.
 targets.yaml
 targets.*.yaml
+
+# Deployment-specific CA for a target's TLS. Public cert, but it identifies
+# the deployment, so it stays out of the public repo like targets.yaml.
+*.pem

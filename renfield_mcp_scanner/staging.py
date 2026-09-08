@@ -44,10 +44,18 @@ class Staging:
         stage.chmod(0o700)
         return stage
 
-    def keep(self, stage: Path, *, reason: str, detail: str = "") -> None:
-        """Retain a stage with the reason it is still here."""
+    def keep(self, stage: Path, *, reason: str, detail: str = "",
+             target: str | None = None) -> None:
+        """Retain a stage with the reason it is still here.
+
+        ``target`` is load-bearing for recovery: without it a retry cannot know
+        where the scan was destined, and KEEP degrades into "kept forever".
+        A scan kept because it was UNROUTED has no target by definition — that
+        one needs a human decision, not a retry.
+        """
         (stage / _META).write_text(json.dumps(
-            {"reason": reason, "detail": detail, "at": datetime.now().isoformat()},
+            {"reason": reason, "detail": detail, "target": target,
+             "at": datetime.now().isoformat()},
             indent=2))
         logger.info("stage %s kept (%s)", stage.name, reason)
 

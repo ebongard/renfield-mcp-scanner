@@ -76,6 +76,16 @@ async def list_pending_scans() -> dict:
     return {"ok": True, "pending": staging.pending()}
 
 
+@mcp.tool()
+async def retry_pending_scans(stage_id: str = "") -> dict:
+    """Re-send scans that are waiting on this host because an earlier push
+    failed — for example the backend was unreachable. Pass a stage_id to retry
+    just one. Scans still awaiting a routing decision are skipped, since they
+    have no destination yet."""
+    config, staging = _ctx()
+    return await t.retry_pending_scans(config, staging, stage_id=stage_id)
+
+
 async def _serve() -> None:
     global _config, _staging
     _config = load_config()
@@ -84,15 +94,6 @@ async def _serve() -> None:
     # Fail-closed BEFORE binding: serving the LAN unauthenticated would let
     # anything on the network drive the scanner and file documents.
     token = require_token(_config.mcp_host, _config.mcp_token)
-    if token:
-        from starlette.middleware.base import BaseHTTPMiddleware
-
-        mcp.streamable_http_app().add_middleware(
-            BaseHTTPMiddleware, dispatch=bearer_auth_middleware(token)
-        )
-        logger.info("MCP endpoint requires a Bearer token")
-    elif is_loopback(_config.mcp_host):
-        logger.info("MCP endpoint unauthenticated — bound to loopback only")
 
     logger.info("scanner MCP on %s:%s — %d target(s), %d pending, %d purged",
                 _config.mcp_host, _config.mcp_port, len(_config.targets),
@@ -100,7 +101,25 @@ async def _serve() -> None:
     # Started here, NOT via FastMCP lifespan: lifespan is the per-MCP-session
     # hook, not ASGI startup, so anything registered there would only run while
     # an agent happens to be connected.
-    await mcp.run_streamable_http_async()
+    # Build the app ONCE and serve THAT instance. FastMCP's
+    # streamable_http_app() constructs a NEW Starlette app on every call, and
+    # run_streamable_http_async() calls it again internally — so middleware added
+    # to a separately-obtained app is silently DISCARDED and the endpoint serves
+    # unauthenticated while looking configured. Found the hard way.
+    import uvicorn
+    from starlette.middleware.base import BaseHTTPMiddleware
+
+    app = mcp.streamable_http_app()
+    if token:
+        app.add_middleware(BaseHTTPMiddleware, dispatch=bearer_auth_middleware(token))
+        logger.info("MCP endpoint requires a Bearer token")
+    elif is_loopback(_config.mcp_host):
+        logger.info("MCP endpoint unauthenticated — bound to loopback only")
+
+    await uvicorn.Server(
+        uvicorn.Config(app, host=_config.mcp_host, port=_config.mcp_port,
+                       log_level=os.environ.get("SCANNER_LOG_LEVEL", "info").lower())
+    ).serve()
 
 
 def main() -> None:

@@ -47,6 +47,12 @@ class ScanTarget(BaseModel):
     scan_profile_id: str = Field(min_length=1)
     # Phase 2: the barcode value on this target's printed separator sheet.
     separator_payload: str = ""
+    # PEM bundle to verify this target's TLS with. A self-hosted backend often
+    # serves a private/self-signed cert: curl may accept it from the OS trust
+    # store while Python does NOT (httpx verifies against certifi), so a push
+    # fails with CERTIFICATE_VERIFY_FAILED even though the URL works in a shell.
+    # Empty = the default trust store. Never disable verification instead.
+    ca_bundle: str = ""
 
     def token(self) -> str:
         value = os.environ.get(self.token_env, "").strip()

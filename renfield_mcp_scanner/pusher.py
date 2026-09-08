@@ -42,9 +42,13 @@ class PushOutcome:
 
 
 class TargetPusher:
-    def __init__(self, base_url: str, token: str, timeout_seconds: float = 120.0):
+    def __init__(self, base_url: str, token: str, timeout_seconds: float = 120.0,
+                 ca_bundle: str = ""):
         self._base = base_url.rstrip("/")
         self._timeout = timeout_seconds
+        # A PEM path, or True for the default trust store. NEVER False — an
+        # unverified push would send documents to whatever answers the name.
+        self._verify: str | bool = ca_bundle or True
         self._headers = {
             "Authorization": f"Bearer {token}",
             CONTRACT_HEADER: SCANNER_INGEST_CONTRACT_VERSION,
@@ -58,7 +62,7 @@ class TargetPusher:
         acknowledged terminal status discards it.
         """
         try:
-            async with httpx.AsyncClient(timeout=self._timeout) as client:
+            async with httpx.AsyncClient(timeout=self._timeout, verify=self._verify) as client:
                 resp = await client.post(
                     f"{self._base}{INGEST_PATH}",
                     headers=self._headers,
@@ -103,7 +107,7 @@ class TargetPusher:
         """Backend liveness probe. Never raises. 401/403 reads as unhealthy —
         that needs an operator, not an automatic retry."""
         try:
-            async with httpx.AsyncClient(timeout=15.0) as client:
+            async with httpx.AsyncClient(timeout=15.0, verify=self._verify) as client:
                 resp = await client.get(f"{self._base}{HEALTH_PATH}", headers=self._headers)
             return resp.status_code == 200
         except httpx.HTTPError:

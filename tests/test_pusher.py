@@ -70,3 +70,20 @@ async def test_contract_skew_is_lenient(monkeypatch):
 async def test_unknown_status_keeps(monkeypatch):
     out = await _push(monkeypatch, _resp(200, {"status": "teleported"}))
     assert out.action is StageAction.KEEP
+
+
+def test_ca_bundle_is_used_for_verification():
+    # A self-hosted backend often serves a private cert: curl may accept it from
+    # the OS trust store while httpx does not (certifi). The fix is a bundle,
+    # never verify=False.
+    assert TargetPusher("http://b", "t", ca_bundle="/tmp/ca.pem")._verify == "/tmp/ca.pem"
+
+
+def test_default_verification_when_no_bundle():
+    assert TargetPusher("http://b", "t")._verify is True
+
+
+def test_verification_is_never_disabled():
+    # An unverified push would send documents to whatever answers the name.
+    for bundle in ("", None):
+        assert TargetPusher("http://b", "t", ca_bundle=bundle or "")._verify is not False

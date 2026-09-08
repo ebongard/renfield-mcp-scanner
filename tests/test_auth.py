@@ -71,3 +71,22 @@ async def test_bad_or_missing_credentials_are_rejected(header):
     result, n = await _call(header)
     assert n == 0, "handler ran despite failed auth"
     assert result.status_code == 401
+
+
+def test_middleware_is_applied_to_the_app_that_is_actually_served():
+    """Regression: FastMCP builds a NEW Starlette app on every
+    streamable_http_app() call, so middleware added to a separately-obtained
+    app is silently discarded and the endpoint serves UNAUTHENTICATED while
+    looking configured. The server must build the app once and serve THAT one."""
+    from mcp.server.fastmcp import FastMCP
+    m = FastMCP("t")
+    assert m.streamable_http_app() is not m.streamable_http_app(), (
+        "FastMCP now caches the app; the guard below can be simplified"
+    )
+    app = m.streamable_http_app()
+    before = len(app.user_middleware)
+    from starlette.middleware.base import BaseHTTPMiddleware
+    app.add_middleware(BaseHTTPMiddleware, dispatch=bearer_auth_middleware("x"))
+    assert len(app.user_middleware) == before + 1
+    # ...and a freshly built app does NOT have it — the trap, asserted.
+    assert len(m.streamable_http_app().user_middleware) == before
