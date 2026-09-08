@@ -82,6 +82,28 @@ async def list_pending_scans() -> dict:
 
 
 @mcp.tool()
+async def route_scan(stage_id: str, target: str) -> dict:
+    """Decide where a waiting scan belongs and file it there.
+
+    Use this for scans reported by `list_pending_scans` that have no
+    destination — either nothing named one, or the suggestion was not confident
+    enough to file automatically. Nothing is ever filed on a guess, so this is
+    how those are resolved.
+    """
+    config, staging = _ctx()
+    return await t.route_scan(config, staging, assemble, stage_id, target)
+
+
+@mcp.tool()
+async def routing_audit(limit: int = 20) -> dict:
+    """Show the recent routing decisions and the reason for each — which target
+    a scan went to, by which layer (declared, separator sheet, classifier,
+    human), and with what confidence."""
+    _, staging = _ctx()
+    return t.routing_audit(staging, limit)
+
+
+@mcp.tool()
 async def generate_separator_sheets() -> dict:
     """Render a printable separator sheet for every configured target.
 

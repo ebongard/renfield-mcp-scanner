@@ -6,11 +6,11 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 
-from . import sane, separator
+from . import audit, classifier, sane, separator
 from .config import Config, MissingTokenError
 from .contract import StageAction
 from .pusher import TargetPusher
-from .router import route
+from .router import Routing, route
 
 logger = logging.getLogger("renfield-mcp-scanner.tools")
 
@@ -134,6 +134,42 @@ async def scan_document(
 
     # SINGLE DOCUMENT — no separator sheets in the stack. Unchanged behaviour.
     if not used_separators:
+        # L3 attaches HERE, after L1 and the n==1 short-circuit have both
+        # declined, and only ever to raise an undecided scan to decided — never
+        # to overrule a destination someone actually stated.
+        if not routing.settled and config.classifier_url and config.classifier_model:
+            pdf_probe = assemble(result.pages, stage_dir, config, title=title)
+            text = classifier.extract_text(pdf_probe)
+            guess = await classifier.classify(
+                text, config.targets,
+                url=config.classifier_url, model=config.classifier_model)
+            if guess and guess.confidence >= config.route_auto_threshold:
+                chosen = config.target_by_id(guess.target_id)
+                if chosen is not None:
+                    audit.record(staging.root, stage=stage_dir.name, layer="classified",
+                                 target=guess.target_id, confidence=guess.confidence,
+                                 evidence=guess.evidence)
+                    routing = Routing(chosen, "classified", guess.confidence,
+                                      f"classified: {guess.evidence}")
+            elif guess:
+                # Below the bar is the NORMAL outcome, not a failure. Record why,
+                # so the review queue can show its reasoning to the human.
+                audit.record(staging.root, stage=stage_dir.name, layer="undecided",
+                             target=guess.target_id, confidence=guess.confidence,
+                             evidence=guess.evidence,
+                             threshold=config.route_auto_threshold)
+                staging.keep(stage_dir, reason="unrouted",
+                             detail=(f"classifier suggested {guess.target_id!r} at "
+                                     f"{guess.confidence:.2f}, below the "
+                                     f"{config.route_auto_threshold:.2f} threshold: "
+                                     f"{guess.evidence}"))
+                return {"ok": True, "routed": False, "pages": len(result.pages),
+                        "stage_id": stage_dir.name,
+                        "suggested_target": guess.target_id,
+                        "confidence": guess.confidence, "evidence": guess.evidence,
+                        "message": "Scan complete. The suggested destination was not "
+                                   "confident enough to file automatically; it is "
+                                   "waiting for a decision."}
         if not routing.settled:
             staging.keep(stage_dir, reason="unrouted", detail=routing.reason)
             return {"ok": True, "routed": False, "pages": len(result.pages),
@@ -141,6 +177,8 @@ async def scan_document(
                     "message": "Scan complete but the destination is not settled; "
                                "it is waiting for a routing decision.",
                     "reason": routing.reason}
+        audit.record(staging.root, stage=stage_dir.name, layer=routing.layer,
+                     target=routing.target.id, confidence=routing.confidence)
         return await _deliver(config, staging, assemble, stage_dir=stage_dir,
                               pages=result.pages, target=routing.target, title=title)
 
@@ -247,3 +285,36 @@ async def retry_pending_scans(config: Config, staging, stage_id: str = "") -> di
         })
 
     return {"ok": True, "retried": len(results), "results": results}
+
+
+async def route_scan(config: Config, staging, assemble, stage_id: str, target: str) -> dict:
+    """Resolve ONE waiting scan to a destination, by hand.
+
+    This is the floor under the whole routing design: everything that could not
+    be settled deterministically, and everything the classifier was not
+    confident enough about, ends here — where a person decides. Nothing is ever
+    filed on a guess, so this path must always exist and always work.
+    """
+    chosen = config.target_by_id(target)
+    if chosen is None:
+        return _err(f"unknown target {target!r}; known: {[t.id for t in config.targets]}")
+
+    stage = staging.root / stage_id
+    if not stage.exists():
+        return _err(f"unknown stage {stage_id!r}")
+
+    pdfs = sorted(stage.glob("*.pdf"))
+    pages = sorted((stage / "pages").glob("p*.png"))
+    if not pdfs and not pages:
+        return _err(f"stage {stage_id!r} holds neither pages nor a PDF")
+    if not pdfs:
+        assemble(pages, stage, config)
+
+    audit.record(staging.root, stage=stage_id, layer="human", target=target)
+    return await _deliver(config, staging, assemble, stage_dir=stage,
+                          pages=pages, target=chosen, title="")
+
+
+def routing_audit(staging, limit: int = 20) -> dict:
+    """The recent routing decisions and why they were made."""
+    return {"ok": True, "decisions": audit.tail(staging.root, limit)}

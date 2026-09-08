@@ -32,8 +32,24 @@ Phases 1 and 2. Declared-intent routing, the `n = 1` short-circuit, real hardwar
 status, durable staging, retry — and **barcode separator sheets**: a stack is
 split at each sheet and each segment routed by the sheet that opened it.
 
-Phase 3 (content classification behind a confidence gate, plus the review floor)
-attaches at a marked point in `router.py`.
+Phase 3 as well: content classification behind a confidence gate, with a human
+review floor beneath it (`route_scan`) and an append-only decision log
+(`routing_audit`).
+
+The classifier mirrors Renfield's own `services/simba_classify.py` — one
+strict-JSON call, the answer validated against an ALLOWLIST of configured target
+ids, best-effort throughout — rather than sharing its code, which lives in the
+backend. One difference governs everything: simba_classify prefills a picker and
+a human corrects it, while this one files a document across a trust boundary
+with nobody looking. So the threshold is far stricter (0.95), and every
+ambiguity — unreachable model, unparseable answer, invented id, low confidence —
+resolves to "undecided", never to a guess.
+
+Measured against a real model: a clearly company-addressed letter scored 0.90
+and still went to the review queue. That is the intended cost, not a defect.
+
+Set `SCANNER_CLASSIFIER_URL` / `SCANNER_CLASSIFIER_MODEL` to enable it; empty
+disables L3 and an undecided scan simply waits for a human.
 
 ## Separator sheets
 
@@ -62,6 +78,8 @@ Requires `zbar` (`brew install zbar`) and the `barcode` extra.
 | `list_pending_scans` | Scans held here awaiting a decision or a retry |
 | `retry_pending_scans` | Re-send scans kept after a failed push |
 | `generate_separator_sheets` | Render a printable sheet per configured target |
+| `route_scan` | Decide where a waiting scan belongs and file it |
+| `routing_audit` | Recent routing decisions and the reason for each |
 
 ## Install (macOS operator host)
 

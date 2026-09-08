@@ -97,7 +97,16 @@ class Config(BaseModel):
     push_timeout_seconds: float = 120.0
     max_concurrent_pushes: int = 4
     health_poll_seconds: int = 60
-    route_auto_threshold: float = 0.85
+    # DELIBERATELY stricter than a suggestion would need. simba_classify can sit
+    # at a lower bar because it only prefills a picker and a human corrects it;
+    # above THIS threshold a document is filed across a trust boundary with
+    # nobody looking. Anything below lands in the review queue, which is a mild
+    # inconvenience — a misroute is not undoable.
+    route_auto_threshold: float = 0.95
+    # OpenAI-compatible endpoint for the L3 classifier. Empty disables L3
+    # entirely: an undecided scan then simply waits for a human.
+    classifier_url: str = ""
+    classifier_model: str = ""
     staging_retention_days: int = 30
     mcp_host: str = "127.0.0.1"
     mcp_port: int = 9093
@@ -142,7 +151,9 @@ def load_config() -> Config:
         push_timeout_seconds=float(env("SCANNER_PUSH_TIMEOUT_SECONDS", "120")),
         max_concurrent_pushes=int(env("SCANNER_MAX_CONCURRENT_PUSHES", "4")),
         health_poll_seconds=int(env("SCANNER_HEALTH_POLL_SECONDS", "60")),
-        route_auto_threshold=float(env("SCANNER_ROUTE_AUTO_THRESHOLD", "0.85")),
+        route_auto_threshold=float(env("SCANNER_ROUTE_AUTO_THRESHOLD", "0.95")),
+        classifier_url=env("SCANNER_CLASSIFIER_URL", ""),
+        classifier_model=env("SCANNER_CLASSIFIER_MODEL", ""),
         staging_retention_days=int(env("SCANNER_STAGING_RETENTION_DAYS", "30")),
         mcp_host=env("SCANNER_MCP_HOST", "127.0.0.1"),
         mcp_port=int(env("SCANNER_MCP_PORT", "9093")),
