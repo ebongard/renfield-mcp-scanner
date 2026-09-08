@@ -16,6 +16,12 @@ kc() { security find-generic-password -a renfield-scanner -s "$1" -w 2>/dev/null
 export SCANNER_TARGETS_YAML="${SCANNER_TARGETS_YAML:-$HERE/targets.yaml}"
 export SCANNER_TOKEN_PRIMARY="$(kc SCANNER_TOKEN_PRIMARY)"
 export SCANNER_MCP_TOKEN="$(kc SCANNER_MCP_TOKEN)"
+# Ein Push-Token je Ziel. Ein fehlendes laesst NUR dieses Ziel ausfallen —
+# der Scanner meldet es beim Preflight namentlich, statt still zu scheitern.
+export SCANNER_TOKEN_XIDRA="$(kc SCANNER_TOKEN_XIDRA)"
+# L3 wird erst ab dem zweiten Ziel relevant: bei einem greift der Kurzschluss.
+export SCANNER_CLASSIFIER_URL="${SCANNER_CLASSIFIER_URL:-http://cuda.local:8081/v1}"
+export SCANNER_CLASSIFIER_MODEL="${SCANNER_CLASSIFIER_MODEL:-qwen3.6}"
 # 0.0.0.0 so the in-cluster backend can reach it. The server REFUSES to bind a
 # non-loopback address unless SCANNER_MCP_TOKEN is set, so a Keychain miss fails
 # closed rather than silently exposing the endpoint.
