@@ -95,6 +95,9 @@ class Config(BaseModel):
     staging_retention_days: int = 30
     mcp_host: str = "127.0.0.1"
     mcp_port: int = 9093
+    # Authenticates RENFIELD TO THIS SERVER (the opposite direction from a
+    # target's push token). Required whenever mcp_host is not loopback.
+    mcp_token: str = ""
     # NO default target, deliberately. A scan that cannot be routed must reach a
     # human; it must never fall back to "whichever instance is first".
 
@@ -137,4 +140,5 @@ def load_config() -> Config:
         staging_retention_days=int(env("SCANNER_STAGING_RETENTION_DAYS", "30")),
         mcp_host=env("SCANNER_MCP_HOST", "127.0.0.1"),
         mcp_port=int(env("SCANNER_MCP_PORT", "9093")),
+        mcp_token=env("SCANNER_MCP_TOKEN", ""),
     )
