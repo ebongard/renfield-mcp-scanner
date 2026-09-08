@@ -28,10 +28,29 @@ No tokens live in the registry: a target names the env var holding its token
 
 ## Status
 
-Phase 1: declared-intent routing (`scan_document(target=...)`), the `n = 1`
-short-circuit, real hardware status, durable staging. Phase 2 (barcode separator
-sheets) and Phase 3 (content classification behind a confidence gate, plus the
-review floor) attach at marked points in `router.py`.
+Phases 1 and 2. Declared-intent routing, the `n = 1` short-circuit, real hardware
+status, durable staging, retry — and **barcode separator sheets**: a stack is
+split at each sheet and each segment routed by the sheet that opened it.
+
+Phase 3 (content classification behind a confidence gate, plus the review floor)
+attaches at a marked point in `router.py`.
+
+## Separator sheets
+
+`generate_separator_sheets` renders one printable A4 sheet per configured
+target. They are generated **from the registry, never by hand** — a sheet whose
+payload has drifted from the configuration fails silently: the stack scans,
+nothing matches, and the documents land unrouted with no obvious cause.
+
+The payload is namespaced and versioned — `RFSEP1:<target_id>` — because real
+documents carry barcodes of their own (a GiroCode on an invoice, a tracking code
+on a parcel notice). Encoding a bare label would let any of those masquerade as
+a separator and silently split a document in half.
+
+A sheet marks a boundary **and** a destination with one mark, which is what lets
+a mixed stack be split and routed in a single pass. It is also the only routing
+layer that survives an unattended scan, since a button press carries no intent.
+Requires `zbar` (`brew install zbar`) and the `barcode` extra.
 
 ## Tools
 
@@ -42,6 +61,7 @@ review floor) attach at marked points in `router.py`.
 | `scan_document` | Scan the feeder, correct, route, push |
 | `list_pending_scans` | Scans held here awaiting a decision or a retry |
 | `retry_pending_scans` | Re-send scans kept after a failed push |
+| `generate_separator_sheets` | Render a printable sheet per configured target |
 
 ## Install (macOS operator host)
 

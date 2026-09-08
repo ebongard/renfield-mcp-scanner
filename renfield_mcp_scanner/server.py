@@ -82,6 +82,27 @@ async def list_pending_scans() -> dict:
 
 
 @mcp.tool()
+async def generate_separator_sheets() -> dict:
+    """Render a printable separator sheet for every configured target.
+
+    A sheet carries its destination ON THE PAPER, which is the only way an
+    unattended stack can be routed. Sheets are generated from the configured
+    targets, never written by hand, so a sheet and the configuration cannot
+    drift apart — a drifted sheet fails silently, scanning fine while matching
+    nothing.
+    """
+    from pathlib import Path
+
+    from .sheets import render_all
+
+    config, _ = _ctx()
+    out_dir = Path(os.environ.get("SCANNER_SHEETS_DIR", "~/Scans")).expanduser()
+    paths = render_all(config.targets, out_dir)
+    return {"ok": True, "sheets": [{"target": t.id, "path": str(p)}
+                                   for t, p in zip(config.targets, paths)]}
+
+
+@mcp.tool()
 async def retry_pending_scans(stage_id: str = "") -> dict:
     """Re-send scans that are waiting on this host because an earlier push
     failed — for example the backend was unreachable. Pass a stage_id to retry

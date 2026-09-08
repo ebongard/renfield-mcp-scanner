@@ -6,7 +6,7 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 
-from . import sane
+from . import sane, separator
 from .config import Config, MissingTokenError
 from .contract import StageAction
 from .pusher import TargetPusher
@@ -49,18 +49,57 @@ async def scanner_status(config: Config) -> dict:
     }
 
 
+async def _deliver(
+    config: Config, staging, assemble, *, stage_dir, pages, target, title: str,
+) -> dict:
+    """Assemble one document's pages and push them to one target."""
+    pdf_path = assemble(pages, stage_dir, config, title=title)
+    try:
+        token = target.token()
+    except MissingTokenError as exc:
+        staging.keep(stage_dir, reason="missing_token", detail=str(exc), target=target.id)
+        return _err(str(exc))
+
+    pusher = TargetPusher(target.base_url, token, config.push_timeout_seconds,
+                          ca_bundle=target.ca_bundle)
+    outcome = await pusher.push(
+        pdf_path.name, pdf_path.read_bytes(),
+        {"filename": pdf_path.name, "scan_profile_id": target.scan_profile_id,
+         "title": title or "", "pages": len(pages), "source": "scanner"},
+    )
+    if outcome.action is StageAction.DISCARD:
+        staging.discard(stage_dir)
+    else:
+        staging.keep(stage_dir, reason=outcome.status or outcome.detail,
+                     detail=outcome.detail, target=target.id)
+
+    return {"ok": outcome.action is StageAction.DISCARD, "routed": True,
+            "target": target.id, "pages": len(pages), "status": outcome.status,
+            # The id is NAMED for its system on purpose. It was returned as a
+            # bare `document_id`, and the agent — surrounded by Paperless tooling
+            # in the documents role — told the user "die Dokument-ID in Paperless
+            # ist 426". It was the RENFIELD id, and the document was not in
+            # Paperless at all yet.
+            "renfield_document_id": outcome.document_id,
+            "paperless_document_id": None,
+            "paperless_note": ("Filing into Paperless happens asynchronously "
+                               "afterwards and has its own separate id; it is "
+                               "not known at scan time."),
+            "fatal": outcome.fatal, "detail": outcome.detail,
+            "stage_id": None if outcome.action is StageAction.DISCARD else stage_dir.name}
+
+
 async def scan_document(
     config: Config, staging, assemble, *, target: str = "", title: str = "",
 ) -> dict:
-    """Scan the feeder, correct it, and route it to exactly one instance.
+    """Scan the feeder, correct it, split at separator sheets, and route.
 
     ``assemble`` builds the searchable PDF from the corrected pages; it is
     injected so the whole flow is testable without a scanner or ocrmypdf.
     """
     routing = route(config, declared=target)
     # Route BEFORE scanning when a destination was declared, so an unknown
-    # target id costs nothing; an undecided routing still scans, because the
-    # pages then wait in staging for a human rather than being refused.
+    # target id costs nothing.
     if routing.target is None and target:
         return _err(routing.reason)
 
@@ -90,52 +129,60 @@ async def scan_document(
         staging.discard(stage_dir)
         return _err("no pages scanned — is the feeder loaded?")
 
-    pdf_path = assemble(result.pages, stage_dir, config, title=title)
+    segments = separator.segment(result.pages)
+    used_separators = any(s.target_id for s in segments) or len(segments) > 1
 
-    if not routing.settled:
-        staging.keep(stage_dir, reason="unrouted", detail=routing.reason)
-        return {"ok": True, "routed": False, "pages": len(result.pages),
-                "stage_id": stage_dir.name,
-                "message": "Scan complete but the destination is not settled; "
-                           "it is waiting for a routing decision.",
-                "reason": routing.reason}
+    # SINGLE DOCUMENT — no separator sheets in the stack. Unchanged behaviour.
+    if not used_separators:
+        if not routing.settled:
+            staging.keep(stage_dir, reason="unrouted", detail=routing.reason)
+            return {"ok": True, "routed": False, "pages": len(result.pages),
+                    "stage_id": stage_dir.name,
+                    "message": "Scan complete but the destination is not settled; "
+                               "it is waiting for a routing decision.",
+                    "reason": routing.reason}
+        return await _deliver(config, staging, assemble, stage_dir=stage_dir,
+                              pages=result.pages, target=routing.target, title=title)
 
-    try:
-        token = routing.target.token()
-    except MissingTokenError as exc:
-        staging.keep(stage_dir, reason="missing_token", detail=str(exc),
-                     target=routing.target.id)
-        return _err(str(exc))
+    # MIXED STACK — a separator both marks the boundary AND names the target.
+    # Splitting is unconditional; routing by sheet applies only when the
+    # operator did not declare a destination. A declared intent is the more
+    # explicit signal, so it wins — but a disagreement is logged, because
+    # silently ignoring the paper in someone's hand is how trust is lost.
+    documents, skipped = [], []
+    for index, seg in enumerate(segments):
+        if target and seg.target_id and seg.target_id != target:
+            logger.warning(
+                "separator sheet says %r but the request declared %r — honouring "
+                "the declared target", seg.target_id, target)
+        seg_target = routing.target if target else (
+            config.target_by_id(seg.target_id) if seg.target_id else routing.target
+        )
+        if seg_target is None:
+            # Pages before the first sheet, or a sheet naming an unknown target.
+            skipped.append({"segment": index, "pages": len(seg.pages),
+                            "reason": "unrouted",
+                            "detail": f"separator target {seg.target_id!r} is not configured"
+                                      if seg.target_id else
+                                      "pages appeared before the first separator sheet"})
+            continue
+        sub = staging.new_stage()
+        for page in seg.pages:
+            page.rename(sub / "pages" / page.name)
+        documents.append(await _deliver(config, staging, assemble, stage_dir=sub,
+                                        pages=sorted((sub / "pages").glob("p*.png")),
+                                        target=seg_target, title=title))
 
-    pusher = TargetPusher(routing.target.base_url, token, config.push_timeout_seconds,
-                          ca_bundle=routing.target.ca_bundle)
-    outcome = await pusher.push(
-        pdf_path.name, pdf_path.read_bytes(),
-        {"filename": pdf_path.name, "scan_profile_id": routing.target.scan_profile_id,
-         "title": title or "", "pages": len(result.pages), "source": "scanner"},
-    )
-
-    if outcome.action is StageAction.DISCARD:
-        staging.discard(stage_dir)
+    if skipped:
+        staging.keep(stage_dir, reason="unrouted",
+                     detail=f"{len(skipped)} segment(s) without a destination")
     else:
-        staging.keep(stage_dir, reason=outcome.status or outcome.detail,
-                     detail=outcome.detail, target=routing.target.id)
+        staging.discard(stage_dir)
 
-    # The id is NAMED for its system on purpose. It was returned as a bare
-    # `document_id`, and the agent — surrounded by Paperless tooling in the
-    # documents role — told the user "die Dokument-ID in Paperless ist 426".
-    # It was the RENFIELD id, and the document was not in Paperless at all yet.
-    # An unqualified id in a tool result is an invitation to mislabel it.
-    return {"ok": outcome.action is StageAction.DISCARD, "routed": True,
-            "target": routing.target.id, "routing_layer": routing.layer,
-            "pages": len(result.pages), "status": outcome.status,
-            "renfield_document_id": outcome.document_id,
-            "paperless_document_id": None,
-            "paperless_note": ("Filing into Paperless happens asynchronously "
-                               "afterwards and has its own separate id; it is "
-                               "not known at scan time."),
-            "fatal": outcome.fatal, "detail": outcome.detail,
-            "stage_id": None if outcome.action is StageAction.DISCARD else stage_dir.name}
+    return {"ok": all(d.get("ok") for d in documents) and not skipped,
+            "routed": True, "split": True,
+            "documents": documents, "skipped": skipped,
+            "segments": len(segments), "pages": len(result.pages)}
 
 
 async def retry_pending_scans(config: Config, staging, stage_id: str = "") -> dict:

@@ -23,7 +23,7 @@ dependencies = [
 [project.optional-dependencies]
 dev = ["pytest>=8.0", "pytest-asyncio>=0.24"]
 # Phase 2 — barcode separator sheets. Optional so Phase 1 installs without zbar.
-barcode = ["pyzbar>=0.1.9"]
+barcode = ["pyzbar>=0.1.9", "qrcode>=7.4"]  # needs the zbar shared lib (brew install zbar)
 
 [project.scripts]
 renfield-mcp-scanner = "renfield_mcp_scanner.server:main"
