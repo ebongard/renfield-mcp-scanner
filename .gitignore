@@ -8,3 +8,8 @@ dist/
 build/
 # Staged scans awaiting a routing decision — private documents, never committed.
 staging/
+
+# The REAL target registry: holds backend URLs and target identities for a
+# specific deployment. Only config/targets.example.yaml is public.
+targets.yaml
+targets.*.yaml
