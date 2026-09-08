@@ -90,7 +90,7 @@ async def scan_document(
         staging.discard(stage_dir)
         return _err("no pages scanned — is the feeder loaded?")
 
-    pdf_path = assemble(result.pages, stage_dir, config)
+    pdf_path = assemble(result.pages, stage_dir, config, title=title)
 
     if not routing.settled:
         staging.keep(stage_dir, reason="unrouted", detail=routing.reason)

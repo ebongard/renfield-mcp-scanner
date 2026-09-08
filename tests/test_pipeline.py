@@ -41,3 +41,35 @@ def test_correction_preserves_dpi_on_save(tmp_path):
     correct_file(p, dpi=300.0)
     with Image.open(p) as im:
         assert round(im.info["dpi"][0]) == 300
+
+
+# --- output filename ---------------------------------------------------------
+
+def test_filename_uses_the_title_when_given():
+    from renfield_mcp_scanner.pdf import output_name
+    from datetime import datetime
+    n = output_name("Rechnung Baumarkt", datetime(2026, 9, 8, 21, 55))
+    assert n == "Rechnung-Baumarkt-2026-09-08-2155.pdf"
+
+
+def test_filename_falls_back_to_a_sortable_default():
+    from renfield_mcp_scanner.pdf import output_name
+    from datetime import datetime
+    assert output_name("", datetime(2026, 9, 8, 21, 55)) == "Scan-2026-09-08-2155.pdf"
+
+
+def test_umlauts_are_transliterated_not_stripped():
+    # "Grundsteuerbescheid für Müller" must not become "Grundsteuerbescheid-fr-Mller"
+    from renfield_mcp_scanner.pdf import _slug
+    assert _slug("Gebührenbescheid Müller Straße") == "Gebuehrenbescheid-Mueller-Strasse"
+
+
+def test_slug_is_filesystem_and_header_safe():
+    from renfield_mcp_scanner.pdf import _slug
+    out = _slug("../../etc/passwd  &  <script>")
+    assert "/" not in out and ".." not in out and "<" not in out and " " not in out
+
+
+def test_slug_is_length_bounded():
+    from renfield_mcp_scanner.pdf import _slug
+    assert len(_slug("x" * 500)) <= 60
