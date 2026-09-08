@@ -39,39 +39,55 @@ def is_loopback(host: str) -> bool:
         return False
 
 
-def require_token(host: str, token: str) -> str:
-    """Fail-closed: refuse to serve the LAN without a token.
+def require_tokens(host: str, tokens: dict[str, str]) -> dict[str, str]:
+    """Fail-closed: refuse to serve the LAN without at least one token.
 
     Starting unauthenticated 'just for now' is exactly how an open
     device-control endpoint becomes permanent, so this raises instead of
     warning.
     """
-    tok = (token or "").strip()
-    if not is_loopback(host) and not tok:
+    clean = {name: t.strip() for name, t in (tokens or {}).items() if (t or "").strip()}
+    if not is_loopback(host) and not clean:
         raise MissingTokenError(
-            f"refusing to bind {host} without SCANNER_MCP_TOKEN — an "
+            f"refusing to bind {host} without a caller token — an "
             "unauthenticated MCP endpoint on the network lets anyone drive the "
-            "scanner and file documents. Set SCANNER_MCP_TOKEN, or bind 127.0.0.1."
+            "scanner and file documents. Set SCANNER_MCP_TOKEN_<CALLER>, or "
+            "bind 127.0.0.1."
         )
-    return tok
+    return clean
 
 
-def bearer_auth_middleware(expected: str):
-    """Starlette middleware enforcing a Bearer token, compared constant-time."""
+def match_caller(tokens: dict[str, str], presented: str) -> str | None:
+    """Which configured caller presented this Bearer header, if any.
+
+    ONE token per caller, so an instance can be revoked without disturbing the
+    others — the same reason the push direction has one credential per target.
+    Every candidate is compared with compare_digest: a plain == leaks length and
+    prefix through timing, and an early exit would leak which caller matched.
+    """
+    prefix = "Bearer "
+    if not presented.startswith(prefix):
+        return None
+    offered = presented[len(prefix):]
+    found = None
+    for name, token in tokens.items():
+        if hmac.compare_digest(offered, token):
+            found = found or name
+    return found
+
+
+def bearer_auth_middleware(tokens: dict[str, str]):
+    """Starlette middleware enforcing a per-caller Bearer token."""
 
     async def middleware(request: Request, call_next):
-        presented = request.headers.get("authorization", "")
-        prefix = "Bearer "
-        # compare_digest on the raw value: a plain == leaks length/prefix timing.
-        ok = presented.startswith(prefix) and hmac.compare_digest(
-            presented[len(prefix):], expected
-        )
-        if not ok:
+        caller = match_caller(tokens, request.headers.get("authorization", ""))
+        if caller is None:
             logger.warning(
                 "rejected unauthenticated MCP request from %s",
                 getattr(request.client, "host", "?"),
             )
             return JSONResponse({"error": "unauthorized"}, status_code=401)
+        request.state.caller = caller
         return await call_next(request)
 
     return middleware

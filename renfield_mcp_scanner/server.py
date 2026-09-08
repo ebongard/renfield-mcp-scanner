@@ -11,7 +11,7 @@ from mcp.server.fastmcp import FastMCP
 
 from . import tools as t
 from .config import Config, load_config
-from .auth import bearer_auth_middleware, is_loopback, require_token
+from .auth import bearer_auth_middleware, is_loopback, require_tokens
 from .pdf import assemble
 from .staging import Staging
 
@@ -141,7 +141,7 @@ async def _serve() -> None:
     purged = _staging.purge_expired(_config.staging_retention_days)
     # Fail-closed BEFORE binding: serving the LAN unauthenticated would let
     # anything on the network drive the scanner and file documents.
-    token = require_token(_config.mcp_host, _config.mcp_token)
+    tokens = require_tokens(_config.mcp_host, _config.mcp_tokens)
 
     logger.info("scanner MCP on %s:%s — %d target(s), %d pending, %d purged",
                 _config.mcp_host, _config.mcp_port, len(_config.targets),
@@ -158,9 +158,10 @@ async def _serve() -> None:
     from starlette.middleware.base import BaseHTTPMiddleware
 
     app = mcp.streamable_http_app()
-    if token:
-        app.add_middleware(BaseHTTPMiddleware, dispatch=bearer_auth_middleware(token))
-        logger.info("MCP endpoint requires a Bearer token")
+    if tokens:
+        app.add_middleware(BaseHTTPMiddleware, dispatch=bearer_auth_middleware(tokens))
+        logger.info("MCP endpoint requires a Bearer token — callers: %s",
+                    ", ".join(sorted(tokens)))
     elif is_loopback(_config.mcp_host):
         logger.info("MCP endpoint unauthenticated — bound to loopback only")
 

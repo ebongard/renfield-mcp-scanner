@@ -105,6 +105,17 @@ the same URL works fine in a shell. Point the target's `ca_bundle` at the PEM.
 Verification is never disabled — an unverified push would send documents to
 whatever answers the hostname.
 
+## Two credential directions, both per-party
+
+| variable | direction | granularity |
+|---|---|---|
+| `SCANNER_TOKEN_<TARGET>` | scanner → Renfield (pushing documents) | one per target |
+| `SCANNER_MCP_TOKEN_<CALLER>` | Renfield → scanner (calling tools) | one per caller |
+
+Both are per-party for the same reason: a shared secret cannot be revoked for
+one party without breaking the others. The server refuses to bind a non-loopback
+address unless at least one caller token is configured.
+
 ## Scan quality
 
 Six defects were measured and fixed once, in `pipeline.py`, `pdf.py` and

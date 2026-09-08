@@ -110,9 +110,11 @@ class Config(BaseModel):
     staging_retention_days: int = 30
     mcp_host: str = "127.0.0.1"
     mcp_port: int = 9093
-    # Authenticates RENFIELD TO THIS SERVER (the opposite direction from a
-    # target's push token). Required whenever mcp_host is not loopback.
-    mcp_token: str = ""
+    # Authenticates A CALLER TO THIS SERVER (the opposite direction from a
+    # target's push token). One entry per caller — an instance can then be
+    # revoked without disturbing the others. Required whenever mcp_host is not
+    # loopback. Populated from SCANNER_MCP_TOKEN_<CALLER> env vars.
+    mcp_tokens: dict[str, str] = Field(default_factory=dict)
     # NO default target, deliberately. A scan that cannot be routed must reach a
     # human; it must never fall back to "whichever instance is first".
 
@@ -129,6 +131,22 @@ def load_targets(path: str | Path) -> list[ScanTarget]:
     """Pure: parse + validate the registry. No env, no I/O beyond the read."""
     raw = yaml.safe_load(Path(path).read_text()) or {}
     return TargetsFile.model_validate(raw).targets
+
+
+def _caller_tokens() -> dict[str, str]:
+    """Collect SCANNER_MCP_TOKEN_<CALLER> vars, plus the legacy singular one.
+
+    The legacy SCANNER_MCP_TOKEN keeps working as the caller "default" so an
+    existing install does not lock itself out on upgrade.
+    """
+    out: dict[str, str] = {}
+    legacy = os.environ.get("SCANNER_MCP_TOKEN", "").strip()
+    if legacy:
+        out["default"] = legacy
+    for key, value in os.environ.items():
+        if key.startswith("SCANNER_MCP_TOKEN_") and value.strip():
+            out[key[len("SCANNER_MCP_TOKEN_"):].lower()] = value.strip()
+    return out
 
 
 def load_config() -> Config:
@@ -157,5 +175,5 @@ def load_config() -> Config:
         staging_retention_days=int(env("SCANNER_STAGING_RETENTION_DAYS", "30")),
         mcp_host=env("SCANNER_MCP_HOST", "127.0.0.1"),
         mcp_port=int(env("SCANNER_MCP_PORT", "9093")),
-        mcp_token=env("SCANNER_MCP_TOKEN", ""),
+        mcp_tokens=_caller_tokens(),
     )

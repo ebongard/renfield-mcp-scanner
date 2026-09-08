@@ -15,7 +15,10 @@ kc() { security find-generic-password -a renfield-scanner -s "$1" -w 2>/dev/null
 
 export SCANNER_TARGETS_YAML="${SCANNER_TARGETS_YAML:-$HERE/targets.yaml}"
 export SCANNER_TOKEN_PRIMARY="$(kc SCANNER_TOKEN_PRIMARY)"
-export SCANNER_MCP_TOKEN="$(kc SCANNER_MCP_TOKEN)"
+# EIN Token je Aufrufer: eine Instanz laesst sich widerrufen, ohne die andere
+# zu stoeren — derselbe Grund wie beim Push-Token je Ziel.
+export SCANNER_MCP_TOKEN_HOUSEHOLD="$(kc SCANNER_MCP_TOKEN_HOUSEHOLD)"
+export SCANNER_MCP_TOKEN_XIDRA="$(kc SCANNER_MCP_TOKEN_XIDRA)"
 # Ein Push-Token je Ziel. Ein fehlendes laesst NUR dieses Ziel ausfallen —
 # der Scanner meldet es beim Preflight namentlich, statt still zu scheitern.
 export SCANNER_TOKEN_XIDRA="$(kc SCANNER_TOKEN_XIDRA)"
@@ -29,6 +32,6 @@ export SCANNER_MCP_HOST="${SCANNER_MCP_HOST:-0.0.0.0}"
 export SCANNER_MCP_PORT="${SCANNER_MCP_PORT:-9093}"
 
 [ -n "$SCANNER_TOKEN_PRIMARY" ] || { echo "SCANNER_TOKEN_PRIMARY not in Keychain" >&2; exit 1; }
-[ -n "$SCANNER_MCP_TOKEN" ]     || { echo "SCANNER_MCP_TOKEN not in Keychain" >&2; exit 1; }
+[ -n "$SCANNER_MCP_TOKEN_HOUSEHOLD$SCANNER_MCP_TOKEN_XIDRA" ] || { echo "kein SCANNER_MCP_TOKEN_<CALLER> im Schluesselbund" >&2; exit 1; }
 
 exec "$HERE/.venv/bin/renfield-mcp-scanner"
