@@ -18,6 +18,13 @@ CONTRACT_HEADER = "X-Folder-Ingest-Contract"
 INGEST_PATH = "/api/folder-ingest/document"
 HEALTH_PATH = "/api/folder-ingest/health"
 
+# Scan-job completion event: the scanner tells the instance that REQUESTED a scan
+# how it ended. A separate seam from ingest (the document may have gone to a
+# different instance than the one that asked), with its own version.
+SCANNER_JOB_EVENT_CONTRACT_VERSION = "1"
+JOB_EVENT_CONTRACT_HEADER = "X-Scanner-Job-Contract"
+JOB_EVENT_PATH = "/api/scanner/job-event"
+
 
 class IngestStatus(str, Enum):
     """The backend's 4-state reply. All four arrive as HTTP 200."""

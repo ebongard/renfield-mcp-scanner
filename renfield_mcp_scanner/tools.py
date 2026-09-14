@@ -3,6 +3,7 @@ unit-testable; server.py is a thin decorated shell over these."""
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from pathlib import Path
 
@@ -53,7 +54,11 @@ async def _deliver(
     config: Config, staging, assemble, *, stage_dir, pages, target, title: str,
 ) -> dict:
     """Assemble one document's pages and push them to one target."""
-    pdf_path = assemble(pages, stage_dir, config, title=title)
+    # Off the event loop: assemble shells out to img2pdf + ocrmypdf and blocks for
+    # seconds per page. Run inline it froze the whole server — a list_tools from
+    # Renfield went unanswered for 12s mid-scan, long enough for the backend's
+    # refresh to declare the scanner dead and tear down the call in flight.
+    pdf_path = await asyncio.to_thread(assemble, pages, stage_dir, config, title=title)
     try:
         token = target.token()
     except MissingTokenError as exc:
@@ -138,8 +143,9 @@ async def scan_document(
         # declined, and only ever to raise an undecided scan to decided — never
         # to overrule a destination someone actually stated.
         if not routing.settled and config.classifier_url and config.classifier_model:
-            pdf_probe = assemble(result.pages, stage_dir, config, title=title)
-            text = classifier.extract_text(pdf_probe)
+            pdf_probe = await asyncio.to_thread(
+                assemble, result.pages, stage_dir, config, title=title)
+            text = await asyncio.to_thread(classifier.extract_text, pdf_probe)
             guess = await classifier.classify(
                 text, config.targets,
                 url=config.classifier_url, model=config.classifier_model)
@@ -308,7 +314,7 @@ async def route_scan(config: Config, staging, assemble, stage_id: str, target: s
     if not pdfs and not pages:
         return _err(f"stage {stage_id!r} holds neither pages nor a PDF")
     if not pdfs:
-        assemble(pages, stage, config)
+        await asyncio.to_thread(assemble, pages, stage, config)
 
     audit.record(staging.root, stage=stage_id, layer="human", target=target)
     return await _deliver(config, staging, assemble, stage_dir=stage,
