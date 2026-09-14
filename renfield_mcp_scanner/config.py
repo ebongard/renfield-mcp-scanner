@@ -124,6 +124,10 @@ class Config(BaseModel):
     # backoff). Matches Renfield's 24 h requester record: an outage shorter than
     # that must not lose the outcome — a count-based budget gave up after ~28 min.
     job_event_retry_hours: float = 24.0
+    # Completion events sent at once to ONE target. After an outage every finished
+    # job has an open event; unbounded they would all hit the instance the moment
+    # it recovers. Only the HTTP request holds a slot, not the backoff sleep.
+    job_event_concurrency: int = Field(default=2, ge=1)
     # NO default target, deliberately. A scan that cannot be routed must reach a
     # human; it must never fall back to "whichever instance is first".
 
@@ -208,4 +212,5 @@ def load_config() -> Config:
         mcp_tokens=_caller_tokens(),
         caller_targets=caller_targets,
         job_event_retry_hours=float(env("SCANNER_JOB_EVENT_RETRY_HOURS", "24")),
+        job_event_concurrency=int(env("SCANNER_JOB_EVENT_CONCURRENCY", "2")),
     )
