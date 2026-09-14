@@ -597,6 +597,24 @@ async def test_retry_after_is_honoured_but_capped(tmp_path, monkeypatch, header,
     assert sleeps == [expected] and job["event"]["state"] == j.EVENT_DELIVERED
 
 
+async def test_a_failing_disk_never_stops_the_event(tmp_path, monkeypatch):
+    """Persisting the event state is for surviving a restart; a full disk must not
+    turn into an outcome nobody is told about."""
+    monkeypatch.setenv("TOK_HH", "secret")
+    store, job = await _job(tmp_path)
+    seen = []
+    notifier, _ = _notifier(tmp_path, [503, 200], seen)
+
+    async def full_disk(_job):
+        raise OSError("No space left on device")
+
+    monkeypatch.setattr(store, "save", full_disk)
+
+    await notifier.deliver(job, store)
+
+    assert len(seen) == 2 and job["event"]["state"] == j.EVENT_DELIVERED
+
+
 def test_event_concurrency_defaults_to_two_and_refuses_zero():
     from pydantic import ValidationError
 

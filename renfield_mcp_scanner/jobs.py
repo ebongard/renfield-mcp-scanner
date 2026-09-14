@@ -306,12 +306,22 @@ class JobEventNotifier:
                        if resp.status_code in _RETRY_AFTER_CODES else None)
         return EVENT_RETRY, retry_after
 
+    @staticmethod
+    async def _persist(job: dict, store: JobStore) -> None:
+        """Record the event state. A full or failing disk costs only its survival
+        across a restart — it must never stop the event itself from being sent."""
+        try:
+            await store.save(job)
+        except OSError:
+            logger.exception("job %s: could not record event state %s", job["job_id"],
+                             job.get("event", {}).get("state"))
+
     async def deliver(self, job: dict, store: JobStore) -> None:
         event = job.setdefault("event", {"state": EVENT_PENDING, "attempts": 0})
         target = self.target_for(job.get("caller"))
         if target is None:
             event["state"] = EVENT_NO_ROUTE
-            await store.save(job)
+            await self._persist(job, store)
             logger.warning("job %s: caller %r has no SCANNER_CALLER_TARGET_* mapping — "
                            "outcome %s is recorded but nobody is told",
                            job["job_id"], job.get("caller"), job["status"])
@@ -323,7 +333,7 @@ class JobEventNotifier:
             event["attempts"] += 1
             state, retry_after = await self.send_once(job, target)
             event["state"] = state
-            await store.save(job)
+            await self._persist(job, store)
             if state != EVENT_RETRY:
                 return
             if self._clock() - started >= horizon:
