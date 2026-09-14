@@ -51,6 +51,24 @@ and still went to the review queue. That is the intended cost, not a defect.
 Set `SCANNER_CLASSIFIER_URL` / `SCANNER_CLASSIFIER_MODEL` to enable it; empty
 disables L3 and an undecided scan simply waits for a human.
 
+**Scan jobs.** `scan_document` starts a job and returns `{job_id, status:
+running}` at once; the scan runs in the background. The scan used to run inside
+the tool call, and on 2026-09-14 that went wrong three ways at once. Renfield's
+30 s call timeout reported a scan as failed that had been filed. A longer timeout
+only let a refresh tear the call down, and the automatic retry then scanned an
+empty feeder. And OCR ran on the event loop, freezing the server for 12 s.
+
+- **How a job ends.** When it finishes, the scanner tells the instance that ASKED,
+  by posting `POST /api/scanner/job-event`. That is an event with capped backoff,
+  never a poll. The caller is known from its Bearer token.
+  `SCANNER_CALLER_TARGET_<CALLER>` names that caller's target, and the target's
+  base URL and push token carry the event.
+- **One scan at a time.** There is one feeder, so a second request while a scan
+  runs gets the running job's id back.
+- **Restarts.** Job records live under `<staging>/jobs`. A restart closes cut-off
+  jobs as `interrupted` and re-sends events that never arrived.
+- **OCR off the event loop.** OCR and PDF assembly run via `asyncio.to_thread`.
+
 ## Separator sheets
 
 `generate_separator_sheets` renders one printable A4 sheet per configured
@@ -74,7 +92,8 @@ Requires `zbar` (`brew install zbar`) and the `barcode` extra.
 |---|---|
 | `list_scanners` | The attached scanner, its settings, configured targets |
 | `scanner_status` | Real hardware state from the SANE sensors — never inferred |
-| `scan_document` | Scan the feeder, correct, route, push |
+| `scan_document` | START a scan job (feed, correct, route, push in the background); returns a `job_id` at once, `busy` while another scan runs |
+| `scan_job_status` | How a job stands or ended — for an explicit question, not for polling |
 | `list_pending_scans` | Scans held here awaiting a decision or a retry |
 | `retry_pending_scans` | Re-send scans kept after a failed push |
 | `generate_separator_sheets` | Render a printable sheet per configured target |
@@ -111,6 +130,7 @@ whatever answers the hostname.
 |---|---|---|
 | `SCANNER_TOKEN_<TARGET>` | scanner → Renfield (pushing documents) | one per target |
 | `SCANNER_MCP_TOKEN_<CALLER>` | Renfield → scanner (calling tools) | one per caller |
+| `SCANNER_CALLER_TARGET_<CALLER>` | scanner → the calling Renfield (job completion events) | names the caller's target; reuses that target's push token |
 
 Both are per-party for the same reason: a shared secret cannot be revoked for
 one party without breaking the others. The server refuses to bind a non-loopback
