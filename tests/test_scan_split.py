@@ -70,6 +70,18 @@ def _marks(monkeypatch, mapping):
                         lambda p: mapping.get(p.name))
 
 
+async def test_errors_carry_a_stable_code(tmp_path, monkeypatch, wired):
+    """The receiving instance renders fixed text from the CODE — the free-form
+    message (exception text, host paths) must never be the only signal."""
+    monkeypatch.setattr("renfield_mcp_scanner.tools.sane.scan_batch", _Scan(0))
+    st = Staging(tmp_path / "st")
+    out = await scan_document(_cfg(tmp_path, "household"), st, _assemble)
+    assert out["ok"] is False and out["error_code"] == "no_pages"
+
+    unknown = await scan_document(_cfg(tmp_path, "household"), st, _assemble, target="ghost")
+    assert unknown["error_code"] == "unknown_target"
+
+
 async def test_stack_without_sheets_stays_one_document(tmp_path, monkeypatch, wired):
     monkeypatch.setattr("renfield_mcp_scanner.tools.sane.scan_batch", _Scan(3))
     _marks(monkeypatch, {})

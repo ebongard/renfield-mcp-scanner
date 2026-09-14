@@ -16,9 +16,14 @@ from .router import Routing, route
 logger = logging.getLogger("renfield-mcp-scanner.tools")
 
 
-def _err(message: str) -> dict:
-    """Agent-facing tools degrade with an error field; they do not raise."""
-    return {"ok": False, "error": message}
+def _err(message: str, code: str = "error") -> dict:
+    """Agent-facing tools degrade with an error field; they do not raise.
+
+    ``error_code`` is the stable, machine-readable half. A completion event
+    carries the code, and the receiving instance renders its own fixed, localised
+    text from it — free-form error text (exception strings, host paths) never
+    becomes chat content on the other side."""
+    return {"ok": False, "error": message, "error_code": code}
 
 
 async def list_scanners(config: Config) -> dict:
@@ -63,7 +68,7 @@ async def _deliver(
         token = target.token()
     except MissingTokenError as exc:
         staging.keep(stage_dir, reason="missing_token", detail=str(exc), target=target.id)
-        return _err(str(exc))
+        return _err(str(exc), "missing_token")
 
     pusher = TargetPusher(target.base_url, token, config.push_timeout_seconds,
                           ca_bundle=target.ca_bundle)
@@ -91,6 +96,9 @@ async def _deliver(
                                "afterwards and has its own separate id; it is "
                                "not known at scan time."),
             "fatal": outcome.fatal, "detail": outcome.detail,
+            **({} if outcome.action is StageAction.DISCARD else {
+                "error_code": "ingest_rejected"
+                if outcome.fatal or outcome.action is StageAction.FAIL else "push_pending"}),
             "stage_id": None if outcome.action is StageAction.DISCARD else stage_dir.name}
 
 
@@ -106,12 +114,12 @@ async def scan_document(
     # Route BEFORE scanning when a destination was declared, so an unknown
     # target id costs nothing.
     if routing.target is None and target:
-        return _err(routing.reason)
+        return _err(routing.reason, "unknown_target")
 
     try:
         device = await sane.find_device(config.device)
     except sane.ScannerError as exc:
-        return _err(str(exc))
+        return _err(str(exc), "device_unavailable")
 
     stage_dir = staging.new_stage()
     try:
@@ -122,17 +130,17 @@ async def scan_document(
         )
     except sane.ScannerError as exc:
         staging.discard(stage_dir)
-        return _err(str(exc))
+        return _err(str(exc), "scan_error")
 
     if result.faulted:
         # Keep the pages: a partial stack is re-scannable only by re-feeding the
         # paper, and filing a silently short document is the worse outcome.
         staging.keep(stage_dir, reason="scanner_fault", detail=result.fault_detail)
         return _err(f"scanner faulted mid-stack after {len(result.pages)} page(s); "
-                    f"pages kept at {stage_dir}. {result.fault_detail}")
+                    f"pages kept at {stage_dir}. {result.fault_detail}", "scanner_fault")
     if not result.pages:
         staging.discard(stage_dir)
-        return _err("no pages scanned — is the feeder loaded?")
+        return _err("no pages scanned — is the feeder loaded?", "no_pages")
 
     segments = separator.segment(result.pages)
     used_separators = any(s.target_id for s in segments) or len(segments) > 1

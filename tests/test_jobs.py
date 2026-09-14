@@ -7,6 +7,7 @@ server's event loop frozen for 12s by OCR, which is what made the refresh give u
 """
 import asyncio
 import json
+import threading
 import time
 from types import SimpleNamespace
 
@@ -17,13 +18,13 @@ from renfield_mcp_scanner import jobs as j
 from renfield_mcp_scanner.config import Config, ScanTarget
 
 
-def _cfg(tmp_path, caller_targets=None, attempts=3):
+def _cfg(tmp_path, caller_targets=None, retry_hours=24.0):
     return Config(
         targets=[ScanTarget(id="household", label="Haushalt", base_url="https://hh:8443",
                             token_env="TOK_HH", scan_profile_id="p")],
         staging_dir=tmp_path / "st",
         caller_targets=caller_targets if caller_targets is not None else {"household": "household"},
-        job_event_max_attempts=attempts,
+        job_event_retry_hours=retry_hours,
     )
 
 
@@ -109,6 +110,54 @@ async def test_second_start_while_busy_names_the_running_job(tmp_path):
     release.set()
     await manager.wait_idle()
     assert calls == [1]
+
+
+async def test_another_caller_learns_nothing_about_the_running_job(tmp_path):
+    """Three instances share one scanner: xidra must not read household's scan."""
+    release = asyncio.Event()
+
+    async def run_scan(target, title):
+        await release.wait()
+        return {"ok": True, "routed": True, "renfield_document_id": 9}
+
+    manager = j.JobManager(j.JobStore(tmp_path), run_scan, _Notifier())
+    mine = await manager.start(caller="household", target="", title="Steuer")
+    theirs = await manager.start(caller="xidra", target="", title="")
+
+    assert theirs["busy"] is True and "job_id" not in theirs
+    assert manager.status(mine["job_id"], caller="xidra") == {
+        "ok": False, "error": f"unknown job {mine['job_id']!r}"}
+    assert manager.status(mine["job_id"], caller="household")["ok"] is True
+    release.set()
+    await manager.wait_idle()
+
+
+def test_purge_survives_an_unreadable_timestamp(tmp_path):
+    """purge runs before the server binds — one odd record must not stop it."""
+    store = j.JobStore(tmp_path)
+    store.save({"job_id": "7" * 32, "status": j.DONE, "finished_at": "yesterday",
+                "event": {"state": j.EVENT_DELIVERED}})
+    store.save({"job_id": "8" * 32, "status": j.DONE,
+                "event": {"state": j.EVENT_DELIVERED}})
+    assert store.purge_settled(30) == 0
+    assert store.purge_settled(0) == 0
+
+
+async def test_recovery_resends_an_event_that_had_given_up(tmp_path, monkeypatch):
+    """An outage longer than the horizon ended; the restart tries once more."""
+    monkeypatch.setenv("TOK_HH", "secret")
+    store = j.JobStore(tmp_path)
+    store.save({"job_id": "9" * 32, "status": j.DONE, "caller": "household",
+                "result": {"ok": True}, "event": {"state": j.EVENT_GAVE_UP, "attempts": 40}})
+    seen = []
+    notifier, _ = _notifier(tmp_path, [200], seen)
+    manager = j.JobManager(store, run_scan=None, notifier=notifier)
+
+    await manager.recover()
+    await manager.wait_idle()
+
+    assert len(seen) == 1
+    assert store.load("9" * 32)["event"] == {"state": j.EVENT_DELIVERED, "attempts": 1}
 
 
 async def test_feeder_is_free_again_after_a_crash(tmp_path):
@@ -209,6 +258,7 @@ def _notifier(tmp_path, replies, seen, **cfg):
 
     notifier = j.JobEventNotifier(
         _cfg(tmp_path, **cfg), sleep=no_sleep,
+        clock=lambda: float(sum(sleeps)),  # time passes only by backing off
         client_factory=lambda **kw: httpx.AsyncClient(transport=transport, **kw))
     return notifier, sleeps
 
@@ -255,15 +305,24 @@ async def test_event_stops_on_answers_a_retry_cannot_fix(tmp_path, monkeypatch, 
     assert len(seen) == 1 and sleeps == []
 
 
-async def test_event_gives_up_after_the_attempt_budget(tmp_path, monkeypatch):
+async def test_event_gives_up_only_after_the_retry_horizon(tmp_path, monkeypatch):
+    """Time-bound, not count-bound: 12 attempts gave up after ~28 min, shorter
+    than an ordinary backend outage. Here the horizon is 3.6 s of backoff."""
     monkeypatch.setenv("TOK_HH", "secret")
     store, job = _job(tmp_path)
     seen = []
-    notifier, _ = _notifier(tmp_path, [503, 503, 503], seen, attempts=3)
+    notifier, sleeps = _notifier(tmp_path, [503, 503, 503], seen, retry_hours=0.001)
 
     await notifier.deliver(job, store)
 
     assert store.load(job["job_id"])["event"] == {"state": j.EVENT_GAVE_UP, "attempts": 3}
+    assert sleeps == [2.0, 4.0]
+
+
+def test_default_retry_horizon_matches_the_backend_record():
+    """Renfield keeps the requester record for 24 h; giving up sooner loses
+    outcomes the backend could still have delivered."""
+    assert Config(targets=[], staging_dir="/tmp/x").job_event_retry_hours == 24.0
 
 
 async def test_caller_without_mapping_sends_nothing(tmp_path):
@@ -319,19 +378,30 @@ async def test_assemble_does_not_block_the_event_loop(tmp_path, monkeypatch):
     config = _cfg(tmp_path)
     staging = Staging(config.staging_dir)
     stage = staging.new_stage()
-    ticks = 0
+    # Deterministic, not timing-based: the loop must be able to finish other work
+    # WHILE assemble is still blocked in its thread.
+    assemble_started = threading.Event()
+    loop_answered_meanwhile = []
 
-    async def ticker():
-        nonlocal ticks
-        while True:
-            await asyncio.sleep(0.01)
-            ticks += 1
+    def blocking_assemble(pages, stage_dir, cfg, title=""):
+        assemble_started.set()
+        time.sleep(0.3)
+        loop_answered_meanwhile.append(bool(answered.is_set()))
+        return slow_assemble(pages, stage_dir, cfg, title)
 
-    tick_task = asyncio.create_task(ticker())
-    await _deliver(config, staging, slow_assemble, stage_dir=stage, pages=[],
-                   target=config.targets[0], title="")
-    tick_task.cancel()
-    assert ticks >= 10, f"event loop was blocked during assemble ({ticks} ticks)"
+    answered = threading.Event()
+
+    async def other_request():
+        while not assemble_started.is_set():
+            await asyncio.sleep(0.001)
+        answered.set()
+
+    await asyncio.gather(
+        _deliver(config, staging, blocking_assemble, stage_dir=stage, pages=[],
+                 target=config.targets[0], title=""),
+        other_request(),
+    )
+    assert loop_answered_meanwhile == [True], "event loop was blocked during assemble"
 
 
 # --- caller extraction -----------------------------------------------------------

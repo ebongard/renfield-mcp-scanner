@@ -23,6 +23,7 @@ import json
 import logging
 import os
 import re
+import time
 import uuid
 from collections.abc import Awaitable, Callable
 from datetime import datetime, timedelta
@@ -55,6 +56,9 @@ EVENT_FATAL = "fatal"
 EVENT_NO_ROUTE = "no_route"
 EVENT_GAVE_UP = "gave_up"
 _EVENT_OPEN = frozenset({EVENT_PENDING, EVENT_RETRY})
+# Re-sent after a restart: still open, or given up during an outage that has
+# since ended — a restart is the cheapest moment to try once more.
+_EVENT_RESEND_ON_RESTART = _EVENT_OPEN | {EVENT_GAVE_UP}
 
 _JOB_ID = re.compile(r"[0-9a-f]{32}")
 
@@ -76,6 +80,14 @@ def _now() -> str:
     return datetime.now().isoformat(timespec="seconds")
 
 
+def public_view(job: dict) -> dict:
+    """What leaves this host about a job — the status answer and the completion
+    event share it, so the two cannot drift apart."""
+    return {"job_id": job["job_id"], "status": job["status"],
+            "title": job.get("title") or "", "started_at": job.get("started_at"),
+            "finished_at": job.get("finished_at"), "result": job.get("result") or {}}
+
+
 class JobStore:
     """One JSON file per job under ``<staging>/jobs``. Private: 0700."""
 
@@ -90,8 +102,13 @@ class JobStore:
         # a caller-supplied id can never walk out of the directory.
         return bool(_JOB_ID.fullmatch(job_id or ""))
 
+    def _path(self, job_id: str) -> Path:
+        if not self.valid_id(job_id):
+            raise ValueError(f"not a job id: {job_id!r}")
+        return self.dir / f"{job_id}.json"
+
     def save(self, job: dict) -> None:
-        path = self.dir / f"{job['job_id']}.json"
+        path = self._path(job["job_id"])
         tmp = path.with_suffix(".tmp")
         tmp.write_text(json.dumps(job, indent=2))
         os.replace(tmp, path)  # atomic: a crash never leaves a half-written record
@@ -99,9 +116,8 @@ class JobStore:
     def load(self, job_id: str) -> dict | None:
         if not self.valid_id(job_id):
             return None
-        path = self.dir / f"{job_id}.json"
         try:
-            return json.loads(path.read_text())
+            return json.loads(self._path(job_id).read_text())
         except (FileNotFoundError, ValueError):
             return None
 
@@ -125,9 +141,16 @@ class JobStore:
                 continue
             if job.get("event", {}).get("state") in _EVENT_OPEN:
                 continue
-            finished = job.get("finished_at")
-            if finished and datetime.fromisoformat(finished) < cutoff:
-                (self.dir / f"{job['job_id']}.json").unlink(missing_ok=True)
+            try:
+                finished = datetime.fromisoformat(job.get("finished_at") or "")
+            except (TypeError, ValueError):
+                # A hand-edited or foreign record must not stop the server from
+                # starting (this runs before it binds); it is simply kept.
+                logger.warning("job %s has no readable finished_at — not purged",
+                               job.get("job_id"))
+                continue
+            if finished < cutoff:
+                self._path(job["job_id"]).unlink(missing_ok=True)
                 removed += 1
         return removed
 
@@ -142,11 +165,13 @@ class JobEventNotifier:
 
     def __init__(self, config: Config, *, base_delay: float = 2.0, max_delay: float = 300.0,
                  sleep: Callable[[float], Awaitable[Any]] = asyncio.sleep,
+                 clock: Callable[[], float] = time.monotonic,
                  client_factory: Callable[..., httpx.AsyncClient] = httpx.AsyncClient):
         self._config = config
         self._base_delay = base_delay
         self._max_delay = max_delay
         self._sleep = sleep
+        self._clock = clock
         self._client_factory = client_factory
 
     def target_for(self, caller: str | None) -> ScanTarget | None:
@@ -156,15 +181,7 @@ class JobEventNotifier:
     @staticmethod
     def payload(job: dict) -> dict:
         # Routing and provenance only — ids, counts, reasons. Never page content.
-        return {
-            "contract_version": SCANNER_JOB_EVENT_CONTRACT_VERSION,
-            "job_id": job["job_id"],
-            "status": job["status"],
-            "title": job.get("title") or "",
-            "started_at": job.get("started_at"),
-            "finished_at": job.get("finished_at"),
-            "result": job.get("result") or {},
-        }
+        return {"contract_version": SCANNER_JOB_EVENT_CONTRACT_VERSION, **public_view(job)}
 
     async def send_once(self, job: dict, target: ScanTarget) -> str:
         try:
@@ -205,19 +222,23 @@ class JobEventNotifier:
                            job["job_id"], job.get("caller"), job["status"])
             return
         delay = self._base_delay
-        while event["attempts"] < self._config.job_event_max_attempts:
+        started = self._clock()
+        horizon = self._config.job_event_retry_hours * 3600
+        while True:
             event["attempts"] += 1
             state = await self.send_once(job, target)
             event["state"] = state
             store.save(job)
             if state != EVENT_RETRY:
                 return
+            if self._clock() - started >= horizon:
+                break
             await self._sleep(delay)
             delay = min(delay * 2, self._max_delay)
         event["state"] = EVENT_GAVE_UP
         store.save(job)
-        logger.error("job %s: completion event not delivered after %d attempts",
-                     job["job_id"], event["attempts"])
+        logger.error("job %s: completion event not delivered within %.1f h (%d attempts)",
+                     job["job_id"], self._config.job_event_retry_hours, event["attempts"])
 
 
 class JobManager:
@@ -229,6 +250,7 @@ class JobManager:
         self._notifier = notifier
         self._lock = asyncio.Lock()
         self._active: str | None = None
+        self._active_caller: str | None = None
         # Strong references: a bare create_task can be garbage-collected mid-run.
         self._tasks: set[asyncio.Task] = set()
 
@@ -240,9 +262,17 @@ class JobManager:
     async def start(self, *, caller: str | None, target: str, title: str) -> dict:
         async with self._lock:
             if self._active is not None:
-                return {"ok": False, "busy": True, "job_id": self._active,
-                        "error": "A scan is already running. Wait for it to finish "
-                                 "before starting another — there is only one feeder."}
+                # `message`, not `error`: busy is an expected answer, and an
+                # `error` field reads as a failed tool call — which invites the
+                # agent to retry exactly what it was told not to.
+                busy = {"ok": False, "busy": True,
+                        "message": "A scan is already running. Wait for it to finish "
+                                   "before starting another — there is only one feeder."}
+                # Only the caller that started it learns the running job's id —
+                # another instance must not be able to read that job.
+                if self._active_caller == caller:
+                    busy["job_id"] = self._active
+                return busy
             job = {
                 "job_id": uuid.uuid4().hex, "status": RUNNING,
                 "caller": caller, "target": target or "", "title": title or "",
@@ -251,6 +281,7 @@ class JobManager:
             }
             self._store.save(job)
             self._active = job["job_id"]
+            self._active_caller = caller
         self._spawn(self._run(job))
         logger.info("job %s started for caller %r", job["job_id"], caller)
         return {"ok": True, "job_id": job["job_id"], "status": RUNNING}
@@ -262,23 +293,25 @@ class JobManager:
                 status = outcome_status(result)
             except Exception as exc:  # noqa: BLE001 - a crash must still end the job
                 logger.exception("job %s crashed", job["job_id"])
-                result, status = {"ok": False, "error": f"scan crashed: {exc}"}, FAILED
+                result = {"ok": False, "error": f"scan crashed: {exc}", "error_code": "crashed"}
+                status = FAILED
             job.update(status=status, result=result, finished_at=_now())
             self._store.save(job)
         finally:
             # Release the feeder BEFORE the event is sent: a slow or unreachable
             # instance must not block the next scan.
             self._active = None
+            self._active_caller = None
         logger.info("job %s finished: %s", job["job_id"], job["status"])
         await self._notifier.deliver(job, self._store)
 
-    def status(self, job_id: str) -> dict:
+    def status(self, job_id: str, caller: str | None = None) -> dict:
+        """A job's state — only to the caller that started it. Another caller
+        gets exactly the reply an id that does not exist would get."""
         job = self._store.load(job_id)
-        if job is None:
+        if job is None or (caller is not None and job.get("caller") != caller):
             return {"ok": False, "error": f"unknown job {job_id!r}"}
-        return {"ok": True, "job_id": job["job_id"], "status": job["status"],
-                "title": job.get("title") or "", "started_at": job.get("started_at"),
-                "finished_at": job.get("finished_at"), "result": job.get("result")}
+        return {"ok": True, **public_view(job)}
 
     async def recover(self) -> dict:
         """Settle what a restart left behind.
@@ -297,7 +330,12 @@ class JobManager:
                 })
                 self._store.save(job)
                 interrupted += 1
-            if job.get("status") in TERMINAL and job.get("event", {}).get("state") in _EVENT_OPEN:
+            if (job.get("status") in TERMINAL
+                    and job.get("event", {}).get("state") in _EVENT_RESEND_ON_RESTART):
+                # A fresh attempt budget: the budget is per run, and an event
+                # that had used it up before the restart would otherwise get
+                # not a single send now.
+                job["event"]["attempts"] = 0
                 self._spawn(self._notifier.deliver(job, self._store))
                 resent += 1
         if interrupted or resent:

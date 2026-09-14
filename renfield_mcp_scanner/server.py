@@ -93,12 +93,11 @@ async def scan_document(ctx: Context, target: str = "", title: str = "") -> dict
     If the destination cannot be settled the scan is kept safely on the scanner
     host and waits for a routing decision — it is never filed into a guess.
     """
-    _ctx()
     return await _job_manager().start(caller=_caller(ctx), target=target, title=title)
 
 
 @mcp.tool()
-async def scan_job_status(job_id: str) -> dict:
+async def scan_job_status(ctx: Context, job_id: str) -> dict:
     """Report how a scan started with `scan_document` stands or ended — only when
     the user explicitly asks about it. Status is `running`, `done`, `unrouted`
     (waiting for a routing decision), `failed` or `interrupted`.
@@ -108,7 +107,7 @@ async def scan_job_status(job_id: str) -> dict:
     its own separate id. Do not report it as a Paperless id, and do not claim the
     document is in Paperless yet.
     """
-    return _job_manager().status(job_id)
+    return _job_manager().status(job_id, caller=_caller(ctx))
 
 
 @mcp.tool()
@@ -179,7 +178,9 @@ async def _serve() -> None:
     purged = _staging.purge_expired(_config.staging_retention_days)
     config, staging = _config, _staging
     store = JobStore(config.staging_dir)
-    store.purge_settled(config.staging_retention_days)
+    purged_jobs = store.purge_settled(config.staging_retention_days)
+    if purged_jobs:
+        logger.info("purged %d settled job record(s)", purged_jobs)
     _jobs = JobManager(
         store,
         run_scan=lambda target, title: t.scan_document(

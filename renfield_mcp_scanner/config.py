@@ -120,8 +120,10 @@ class Config(BaseModel):
     # SCANNER_CALLER_TARGET_<CALLER>=<target id>. A caller without a mapping
     # still gets its scan done; only the completion event cannot be sent.
     caller_targets: dict[str, str] = Field(default_factory=dict)
-    # Delivery attempts for one completion event (exponential backoff, capped).
-    job_event_max_attempts: int = 12
+    # How long one completion event keeps being retried (capped exponential
+    # backoff). Matches Renfield's 24 h requester record: an outage shorter than
+    # that must not lose the outcome — a count-based budget gave up after ~28 min.
+    job_event_retry_hours: float = 24.0
     # NO default target, deliberately. A scan that cannot be routed must reach a
     # human; it must never fall back to "whichever instance is first".
 
@@ -205,5 +207,5 @@ def load_config() -> Config:
         mcp_port=int(env("SCANNER_MCP_PORT", "9093")),
         mcp_tokens=_caller_tokens(),
         caller_targets=caller_targets,
-        job_event_max_attempts=int(env("SCANNER_JOB_EVENT_MAX_ATTEMPTS", "12")),
+        job_event_retry_hours=float(env("SCANNER_JOB_EVENT_RETRY_HOURS", "24")),
     )
