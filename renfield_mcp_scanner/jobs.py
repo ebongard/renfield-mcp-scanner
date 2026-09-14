@@ -346,7 +346,11 @@ class JobEventNotifier:
             await self._sleep(wait)
             delay = min(delay * 2, self._max_delay)
         event["state"] = EVENT_GAVE_UP
-        await store.save(job)
+        # Through _persist like every other state write: this runs in a background
+        # task, where an OSError would only surface as an unretrieved exception.
+        # If it fails, the record keeps its last saved `retry` — still re-sent on
+        # the next restart.
+        await self._persist(job, store)
         logger.error("job %s: completion event not delivered within %.1f h (%d attempts)",
                      job["job_id"], self._config.job_event_retry_hours, event["attempts"])
 

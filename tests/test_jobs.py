@@ -615,6 +615,31 @@ async def test_a_failing_disk_never_stops_the_event(tmp_path, monkeypatch):
     assert len(seen) == 2 and job["event"]["state"] == j.EVENT_DELIVERED
 
 
+async def test_a_failing_disk_on_the_final_give_up_save_does_not_escape(tmp_path, monkeypatch):
+    """Review finding: the give-up save after the horizon bypassed _persist, so a
+    full disk escaped as an unretrieved task exception."""
+    monkeypatch.setenv("TOK_HH", "secret")
+    store, job = await _job(tmp_path)
+    seen = []
+    notifier, _ = _notifier(tmp_path, [503, 503, 503], seen, retry_hours=0.001)
+    real_save = store.save
+
+    async def disk_full_on_give_up(job_):
+        if job_["event"]["state"] == j.EVENT_GAVE_UP:
+            raise OSError("No space left on device")
+        await real_save(job_)
+
+    monkeypatch.setattr(store, "save", disk_full_on_give_up)
+
+    await notifier.deliver(job, store)  # must not raise
+
+    assert job["event"]["state"] == j.EVENT_GAVE_UP
+    on_disk = await store.load(job["job_id"])
+    # The last state that reached the disk is still one a restart re-sends.
+    assert on_disk["event"]["state"] == j.EVENT_RETRY
+    assert on_disk["event"]["state"] in j._EVENT_RESEND_ON_RESTART
+
+
 def test_event_concurrency_defaults_to_two_and_refuses_zero():
     from pydantic import ValidationError
 
