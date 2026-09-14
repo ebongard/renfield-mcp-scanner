@@ -107,7 +107,7 @@ async def scan_job_status(ctx: Context, job_id: str) -> dict:
     its own separate id. Do not report it as a Paperless id, and do not claim the
     document is in Paperless yet.
     """
-    return _job_manager().status(job_id, caller=_caller(ctx))
+    return await _job_manager().status(job_id, caller=_caller(ctx))
 
 
 @mcp.tool()
@@ -178,7 +178,9 @@ async def _serve() -> None:
     purged = _staging.purge_expired(_config.staging_retention_days)
     config, staging = _config, _staging
     store = JobStore(config.staging_dir)
-    purged_jobs = store.purge_settled(config.staging_retention_days)
+    # Records left from before this start; from here on every job whose event
+    # settles triggers the same sweep (JobManager._deliver_and_tidy).
+    purged_jobs = await store.purge_settled(config.staging_retention_days)
     if purged_jobs:
         logger.info("purged %d settled job record(s)", purged_jobs)
     _jobs = JobManager(
@@ -186,6 +188,7 @@ async def _serve() -> None:
         run_scan=lambda target, title: t.scan_document(
             config, staging, assemble, target=target, title=title),
         notifier=JobEventNotifier(config),
+        retention_days=config.staging_retention_days,
     )
     # Close jobs a restart cut off and re-send events that never got through.
     await _jobs.recover()

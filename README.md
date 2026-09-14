@@ -68,6 +68,22 @@ empty feeder. And OCR ran on the event loop, freezing the server for 12 s.
 - **Restarts.** Job records live under `<staging>/jobs`. A restart closes cut-off
   jobs as `interrupted` and re-sends events that never arrived.
 - **OCR off the event loop.** OCR and PDF assembly run via `asyncio.to_thread`.
+- **Job records off the event loop, atomically.** Every read and write of a job
+  record runs in a worker thread. A write goes to a unique temp file, is fsynced,
+  then renamed over the record. Writes run one at a time in call order, and the
+  record is serialized when `save` is called, so a slow earlier write can never
+  overwrite a newer state.
+- **Cleanup while running.** A finished job's record is dropped once its event
+  has settled and `SCANNER_STAGING_RETENTION_DAYS` have passed. The sweep runs
+  whenever a job's event settles, and once at startup. It is not on a timer: the
+  directory only grows when a job finishes, so sweeping then keeps it bounded
+  without waking up on days nobody scans. A record with an open event is never
+  dropped.
+- **Bounded delivery after an outage.** At most `SCANNER_JOB_EVENT_CONCURRENCY`
+  (default 2) events are in flight per target at once. Only the HTTP request
+  holds a slot, not the backoff sleep. The backoff is jittered so open events do
+  not retry in lockstep, and a `Retry-After` on 429/503 is honoured up to the
+  5-minute backoff cap. The 24 h retry horizon is unchanged.
 
 ## Separator sheets
 
