@@ -7,11 +7,12 @@ import logging
 import os
 import sys
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp import Context, FastMCP
 
 from . import tools as t
 from .config import Config, load_config
 from .auth import bearer_auth_middleware, is_loopback, require_tokens
+from .jobs import JobEventNotifier, JobManager, JobStore
 from .pdf import assemble
 from .staging import Staging
 
@@ -30,12 +31,31 @@ mcp = FastMCP(
 
 _config: Config | None = None
 _staging: Staging | None = None
+_jobs: JobManager | None = None
 
 
 def _ctx() -> tuple[Config, Staging]:
     if _config is None or _staging is None:
         raise RuntimeError("scanner server not initialised")
     return _config, _staging
+
+
+def _job_manager() -> JobManager:
+    if _jobs is None:
+        raise RuntimeError("scanner server not initialised")
+    return _jobs
+
+
+def _caller(ctx: Context | None) -> str:
+    """The authenticated caller the Bearer middleware recorded on the request.
+
+    Unauthenticated loopback serving has no middleware and so no caller; that is
+    the "default" caller, the same name the legacy singular token maps to."""
+    try:
+        request = ctx.request_context.request  # type: ignore[union-attr]
+        return getattr(request.state, "caller", None) or "default"
+    except (AttributeError, ValueError, LookupError):
+        return "default"
 
 
 @mcp.tool()
@@ -55,22 +75,39 @@ async def scanner_status() -> dict:
 
 
 @mcp.tool()
-async def scan_document(target: str = "", title: str = "") -> dict:
-    """Scan every sheet in the document feeder into one searchable PDF and file
-    it into a single Renfield instance.
+async def scan_document(ctx: Context, target: str = "", title: str = "") -> dict:
+    """START scanning every sheet in the document feeder into one searchable PDF
+    and filing it into a single Renfield instance.
+
+    This returns IMMEDIATELY with a `job_id` — the scan itself runs in the
+    background and takes from half a minute to several minutes. Tell the user the
+    scan has started and that they will be notified when it is done. Do NOT say
+    the document was scanned or filed, and do NOT call `scan_job_status` in a
+    loop to wait for it: the outcome is reported automatically when it finishes.
+
+    If a scan is already running this returns `busy` with that job's id — there
+    is one feeder; do not retry.
 
     Pass `target` to name the destination instance when more than one is
     configured. With exactly one configured target it is chosen automatically.
     If the destination cannot be settled the scan is kept safely on the scanner
     host and waits for a routing decision — it is never filed into a guess.
-
-    The result's `renfield_document_id` is the id IN RENFIELD. It is NOT a
-    Paperless id: filing into Paperless runs asynchronously afterwards, gets its
-    own separate id, and that id is not known when this returns. Do not report
-    it as a Paperless id, and do not claim the document is in Paperless yet.
     """
-    config, staging = _ctx()
-    return await t.scan_document(config, staging, assemble, target=target, title=title)
+    return await _job_manager().start(caller=_caller(ctx), target=target, title=title)
+
+
+@mcp.tool()
+async def scan_job_status(ctx: Context, job_id: str) -> dict:
+    """Report how a scan started with `scan_document` stands or ended — only when
+    the user explicitly asks about it. Status is `running`, `done`, `unrouted`
+    (waiting for a routing decision), `failed` or `interrupted`.
+
+    In a finished result, `renfield_document_id` is the id IN RENFIELD. It is NOT
+    a Paperless id: filing into Paperless runs asynchronously afterwards and gets
+    its own separate id. Do not report it as a Paperless id, and do not claim the
+    document is in Paperless yet.
+    """
+    return _job_manager().status(job_id, caller=_caller(ctx))
 
 
 @mcp.tool()
@@ -135,10 +172,26 @@ async def retry_pending_scans(stage_id: str = "") -> dict:
 
 
 async def _serve() -> None:
-    global _config, _staging
+    global _config, _staging, _jobs
     _config = load_config()
     _staging = Staging(_config.staging_dir)
     purged = _staging.purge_expired(_config.staging_retention_days)
+    config, staging = _config, _staging
+    store = JobStore(config.staging_dir)
+    purged_jobs = store.purge_settled(config.staging_retention_days)
+    if purged_jobs:
+        logger.info("purged %d settled job record(s)", purged_jobs)
+    _jobs = JobManager(
+        store,
+        run_scan=lambda target, title: t.scan_document(
+            config, staging, assemble, target=target, title=title),
+        notifier=JobEventNotifier(config),
+    )
+    # Close jobs a restart cut off and re-send events that never got through.
+    await _jobs.recover()
+    if config.mcp_tokens and not config.caller_targets:
+        logger.warning("no SCANNER_CALLER_TARGET_* mapping — scans run, but no "
+                       "instance is told when one finishes")
     # Fail-closed BEFORE binding: serving the LAN unauthenticated would let
     # anything on the network drive the scanner and file documents.
     tokens = require_tokens(_config.mcp_host, _config.mcp_tokens)

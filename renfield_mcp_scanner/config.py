@@ -115,6 +115,15 @@ class Config(BaseModel):
     # revoked without disturbing the others. Required whenever mcp_host is not
     # loopback. Populated from SCANNER_MCP_TOKEN_<CALLER> env vars.
     mcp_tokens: dict[str, str] = Field(default_factory=dict)
+    # Which TARGET each caller is — the return path for scan-job completion
+    # events (base_url + push token of that instance). Populated from
+    # SCANNER_CALLER_TARGET_<CALLER>=<target id>. A caller without a mapping
+    # still gets its scan done; only the completion event cannot be sent.
+    caller_targets: dict[str, str] = Field(default_factory=dict)
+    # How long one completion event keeps being retried (capped exponential
+    # backoff). Matches Renfield's 24 h requester record: an outage shorter than
+    # that must not lose the outcome — a count-based budget gave up after ~28 min.
+    job_event_retry_hours: float = 24.0
     # NO default target, deliberately. A scan that cannot be routed must reach a
     # human; it must never fall back to "whichever instance is first".
 
@@ -149,6 +158,26 @@ def _caller_tokens() -> dict[str, str]:
     return out
 
 
+def _caller_targets(target_ids: set[str]) -> dict[str, str]:
+    """Collect SCANNER_CALLER_TARGET_<CALLER>=<target id>.
+
+    A mapping to an unknown target is dropped with a warning rather than kept:
+    it could never be delivered, and failing the whole server over the return
+    path would also stop the scans themselves."""
+    out: dict[str, str] = {}
+    prefix = "SCANNER_CALLER_TARGET_"
+    for key, value in os.environ.items():
+        if not key.startswith(prefix) or not value.strip():
+            continue
+        caller, target_id = key[len(prefix):].lower(), value.strip()
+        if target_id not in target_ids:
+            logger.warning("%s names unknown target %r — no completion events for "
+                           "caller %r", key, target_id, caller)
+            continue
+        out[caller] = target_id
+    return out
+
+
 def load_config() -> Config:
     env = os.environ.get
     targets_yaml = env("SCANNER_TARGETS_YAML", "").strip()
@@ -156,6 +185,7 @@ def load_config() -> Config:
         raise ValueError("SCANNER_TARGETS_YAML is required (path to the target registry)")
     targets = load_targets(targets_yaml)
     logger.info("loaded %d routing target(s): %s", len(targets), [t.id for t in targets])
+    caller_targets = _caller_targets({t.id for t in targets})
     return Config(
         targets=targets,
         staging_dir=Path(env("SCANNER_STAGING_DIR", "~/.renfield-scanner/staging")).expanduser(),
@@ -176,4 +206,6 @@ def load_config() -> Config:
         mcp_host=env("SCANNER_MCP_HOST", "127.0.0.1"),
         mcp_port=int(env("SCANNER_MCP_PORT", "9093")),
         mcp_tokens=_caller_tokens(),
+        caller_targets=caller_targets,
+        job_event_retry_hours=float(env("SCANNER_JOB_EVENT_RETRY_HOURS", "24")),
     )

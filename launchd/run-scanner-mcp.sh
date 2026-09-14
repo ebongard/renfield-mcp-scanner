@@ -19,6 +19,11 @@ export SCANNER_TOKEN_PRIMARY="$(kc SCANNER_TOKEN_PRIMARY)"
 # zu stoeren — derselbe Grund wie beim Push-Token je Ziel.
 export SCANNER_MCP_TOKEN_HOUSEHOLD="$(kc SCANNER_MCP_TOKEN_HOUSEHOLD)"
 export SCANNER_MCP_TOKEN_XIDRA="$(kc SCANNER_MCP_TOKEN_XIDRA)"
+# Rueckkanal fuer Scan-Job-Ergebnisse: welcher Aufrufer welches Ziel IST. Das
+# Ergebnis geht an die Instanz, die den Scan angefordert hat — ueber deren
+# base_url und Push-Token. Kein neues Geheimnis; ohne Zuordnung meldet niemand.
+export SCANNER_CALLER_TARGET_HOUSEHOLD="${SCANNER_CALLER_TARGET_HOUSEHOLD:-household}"
+export SCANNER_CALLER_TARGET_XIDRA="${SCANNER_CALLER_TARGET_XIDRA:-xidra}"
 # Ein Push-Token je Ziel. Ein fehlendes laesst NUR dieses Ziel ausfallen —
 # der Scanner meldet es beim Preflight namentlich, statt still zu scheitern.
 export SCANNER_TOKEN_XIDRA="$(kc SCANNER_TOKEN_XIDRA)"

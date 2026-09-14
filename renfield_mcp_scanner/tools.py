@@ -3,6 +3,7 @@ unit-testable; server.py is a thin decorated shell over these."""
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from pathlib import Path
 
@@ -15,9 +16,14 @@ from .router import Routing, route
 logger = logging.getLogger("renfield-mcp-scanner.tools")
 
 
-def _err(message: str) -> dict:
-    """Agent-facing tools degrade with an error field; they do not raise."""
-    return {"ok": False, "error": message}
+def _err(message: str, code: str = "error") -> dict:
+    """Agent-facing tools degrade with an error field; they do not raise.
+
+    ``error_code`` is the stable, machine-readable half. A completion event
+    carries the code, and the receiving instance renders its own fixed, localised
+    text from it — free-form error text (exception strings, host paths) never
+    becomes chat content on the other side."""
+    return {"ok": False, "error": message, "error_code": code}
 
 
 async def list_scanners(config: Config) -> dict:
@@ -53,12 +59,16 @@ async def _deliver(
     config: Config, staging, assemble, *, stage_dir, pages, target, title: str,
 ) -> dict:
     """Assemble one document's pages and push them to one target."""
-    pdf_path = assemble(pages, stage_dir, config, title=title)
+    # Off the event loop: assemble shells out to img2pdf + ocrmypdf and blocks for
+    # seconds per page. Run inline it froze the whole server — a list_tools from
+    # Renfield went unanswered for 12s mid-scan, long enough for the backend's
+    # refresh to declare the scanner dead and tear down the call in flight.
+    pdf_path = await asyncio.to_thread(assemble, pages, stage_dir, config, title=title)
     try:
         token = target.token()
     except MissingTokenError as exc:
         staging.keep(stage_dir, reason="missing_token", detail=str(exc), target=target.id)
-        return _err(str(exc))
+        return _err(str(exc), "missing_token")
 
     pusher = TargetPusher(target.base_url, token, config.push_timeout_seconds,
                           ca_bundle=target.ca_bundle)
@@ -86,6 +96,9 @@ async def _deliver(
                                "afterwards and has its own separate id; it is "
                                "not known at scan time."),
             "fatal": outcome.fatal, "detail": outcome.detail,
+            **({} if outcome.action is StageAction.DISCARD else {
+                "error_code": "ingest_rejected"
+                if outcome.fatal or outcome.action is StageAction.FAIL else "push_pending"}),
             "stage_id": None if outcome.action is StageAction.DISCARD else stage_dir.name}
 
 
@@ -101,12 +114,12 @@ async def scan_document(
     # Route BEFORE scanning when a destination was declared, so an unknown
     # target id costs nothing.
     if routing.target is None and target:
-        return _err(routing.reason)
+        return _err(routing.reason, "unknown_target")
 
     try:
         device = await sane.find_device(config.device)
     except sane.ScannerError as exc:
-        return _err(str(exc))
+        return _err(str(exc), "device_unavailable")
 
     stage_dir = staging.new_stage()
     try:
@@ -117,17 +130,17 @@ async def scan_document(
         )
     except sane.ScannerError as exc:
         staging.discard(stage_dir)
-        return _err(str(exc))
+        return _err(str(exc), "scan_error")
 
     if result.faulted:
         # Keep the pages: a partial stack is re-scannable only by re-feeding the
         # paper, and filing a silently short document is the worse outcome.
         staging.keep(stage_dir, reason="scanner_fault", detail=result.fault_detail)
         return _err(f"scanner faulted mid-stack after {len(result.pages)} page(s); "
-                    f"pages kept at {stage_dir}. {result.fault_detail}")
+                    f"pages kept at {stage_dir}. {result.fault_detail}", "scanner_fault")
     if not result.pages:
         staging.discard(stage_dir)
-        return _err("no pages scanned — is the feeder loaded?")
+        return _err("no pages scanned — is the feeder loaded?", "no_pages")
 
     segments = separator.segment(result.pages)
     used_separators = any(s.target_id for s in segments) or len(segments) > 1
@@ -138,8 +151,9 @@ async def scan_document(
         # declined, and only ever to raise an undecided scan to decided — never
         # to overrule a destination someone actually stated.
         if not routing.settled and config.classifier_url and config.classifier_model:
-            pdf_probe = assemble(result.pages, stage_dir, config, title=title)
-            text = classifier.extract_text(pdf_probe)
+            pdf_probe = await asyncio.to_thread(
+                assemble, result.pages, stage_dir, config, title=title)
+            text = await asyncio.to_thread(classifier.extract_text, pdf_probe)
             guess = await classifier.classify(
                 text, config.targets,
                 url=config.classifier_url, model=config.classifier_model)
@@ -308,7 +322,7 @@ async def route_scan(config: Config, staging, assemble, stage_id: str, target: s
     if not pdfs and not pages:
         return _err(f"stage {stage_id!r} holds neither pages nor a PDF")
     if not pdfs:
-        assemble(pages, stage, config)
+        await asyncio.to_thread(assemble, pages, stage, config)
 
     audit.record(staging.root, stage=stage_id, layer="human", target=target)
     return await _deliver(config, staging, assemble, stage_dir=stage,
