@@ -221,10 +221,30 @@ async def _serve() -> None:
     elif is_loopback(_config.mcp_host):
         logger.info("MCP endpoint unauthenticated — bound to loopback only")
 
-    await uvicorn.Server(
-        uvicorn.Config(app, host=_config.mcp_host, port=_config.mcp_port,
-                       log_level=os.environ.get("SCANNER_LOG_LEVEL", "info").lower())
-    ).serve()
+    # Der Knopfwächter läuft NEBEN dem Server, nicht in dessen Lifespan: ein
+    # Knopfdruck muss auch dann wirken, wenn gerade kein Agent verbunden ist —
+    # das ist ja sein Sinn. Als Task, damit ein Fehler dort den Server nicht
+    # mitreisst; der Wächter fängt seine eigenen Fehler ohnehin ab.
+    button_task = None
+    if _config.button_watch:
+        from .button import watch_button
+
+        button_task = asyncio.create_task(
+            watch_button(_config, lambda **kw: _job_manager().start(**kw)),
+            name="scanner-button-watch",
+        )
+        logger.info("Knopfwächter aktiv — der blaue Knopf startet einen Scan")
+    else:
+        logger.info("Knopfwächter AUS (SCANNER_BUTTON_WATCH)")
+
+    try:
+        await uvicorn.Server(
+            uvicorn.Config(app, host=_config.mcp_host, port=_config.mcp_port,
+                           log_level=os.environ.get("SCANNER_LOG_LEVEL", "info").lower())
+        ).serve()
+    finally:
+        if button_task is not None:
+            button_task.cancel()
 
 
 def main() -> None:

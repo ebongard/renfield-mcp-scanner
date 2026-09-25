@@ -97,6 +97,11 @@ class Config(BaseModel):
     push_timeout_seconds: float = 120.0
     max_concurrent_pushes: int = 4
     health_poll_seconds: int = 60
+    # Der blaue Knopf am Gerät startet einen Scan. AN by default: ohne ihn
+    # ist der Scanner nur über einen Agenten bedienbar, und genau das war
+    # die Lücke (2026-09-25). `SCANNER_BUTTON_WATCH=false` schaltet ihn ab,
+    # etwa auf einem Host ohne angeschlossenes Gerät.
+    button_watch: bool = True
     # DELIBERATELY stricter than a suggestion would need. simba_classify can sit
     # at a lower bar because it only prefills a picker and a human corrects it;
     # above THIS threshold a document is filed across a trust boundary with
@@ -213,4 +218,6 @@ def load_config() -> Config:
         caller_targets=caller_targets,
         job_event_retry_hours=float(env("SCANNER_JOB_EVENT_RETRY_HOURS", "24")),
         job_event_concurrency=int(env("SCANNER_JOB_EVENT_CONCURRENCY", "2")),
+        button_watch=env("SCANNER_BUTTON_WATCH", "true").strip().lower()
+        not in ("0", "false", "no", "off"),
     )

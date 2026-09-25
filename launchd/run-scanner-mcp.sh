@@ -24,6 +24,12 @@ export SCANNER_MCP_TOKEN_XIDRA="$(kc SCANNER_MCP_TOKEN_XIDRA)"
 # base_url und Push-Token. Kein neues Geheimnis; ohne Zuordnung meldet niemand.
 export SCANNER_CALLER_TARGET_HOUSEHOLD="${SCANNER_CALLER_TARGET_HOUSEHOLD:-household}"
 export SCANNER_CALLER_TARGET_XIDRA="${SCANNER_CALLER_TARGET_XIDRA:-xidra}"
+# Wohin die FERTIGMELDUNG eines knopfgestarteten Scans geht. Ohne diese Zeile
+# laeuft der Scan zwar durch und das Dokument wird zugestellt, aber niemand
+# erfaehrt davon: "outcome done is recorded but nobody is told" (2026-09-25).
+# Betrifft NUR die Meldung — wohin das DOKUMENT geht, entscheidet weiterhin der
+# Klassifizierer, und ein Trennblatt sticht ihn aus.
+export SCANNER_CALLER_TARGET_BUTTON="${SCANNER_CALLER_TARGET_BUTTON:-household}"
 # Ein Push-Token je Ziel. Ein fehlendes laesst NUR dieses Ziel ausfallen —
 # der Scanner meldet es beim Preflight namentlich, statt still zu scheitern.
 export SCANNER_TOKEN_XIDRA="$(kc SCANNER_TOKEN_XIDRA)"

@@ -68,7 +68,16 @@ async def _run(*args: str, timeout: float = 600.0) -> tuple[int, str]:
     try:
         out, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
     except asyncio.TimeoutError:
+        # kill() SENDET nur das Signal. Ohne das Warten kehrt _run zurueck,
+        # waehrend der Prozess das USB-Geraet noch haelt — der naechste Aufruf
+        # findet dann "no Fujitsu scanner found". Kurz begrenzt, damit ein in
+        # ununterbrechbarer USB-E/A steckender Prozess uns nicht mitnimmt.
         proc.kill()
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=5.0)
+        except asyncio.TimeoutError:
+            logger.warning("scanimage %s liess sich nach dem Abbruch nicht beenden "
+                           "— das Geraet bleibt moeglicherweise belegt", proc.pid)
         raise ScannerError(f"scanimage timed out after {timeout}s") from None
     return proc.returncode or 0, out.decode("utf-8", "replace")
 
