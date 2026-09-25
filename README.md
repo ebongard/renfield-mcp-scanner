@@ -102,6 +102,28 @@ a mixed stack be split and routed in a single pass. It is also the only routing
 layer that survives an unattended scan, since a button press carries no intent.
 Requires `zbar` (`brew install zbar`) and the `barcode` extra.
 
+## Der blaue Knopf
+
+Ein Druck am Gerät startet einen Scan — dieselbe Strecke wie `scan_document`,
+nur ohne Agenten. Ein Hardwareknopf sendet kein Ereignis, also wird der
+SANE-Sensor gepollt; das ist die einzige verfügbare Bauform, nicht Bequemlichkeit.
+
+Zwei Takte, beide gemessen: ohne Papier im Einzug eine Abfrage je Sekunde (dort
+kann ohnehin nichts starten), mit Papier alle 200 ms. Der Knopf meldet einen
+Impuls von rund 200 ms je Druck — er verriegelt nicht und meldet kein Halten,
+länger drücken bringt also nichts.
+
+🛑 **Der Takt ist nach OBEN und nach UNTEN begrenzt.** Zehn Abfragen je Sekunde
+belegten den Scanner zu 42 % der Zeit und setzten ihn nach einer halben Stunde
+fest (SANE fand ihn nicht mehr, erst Aus- und Einschalten half). Die teure
+Ressource ist hier das Gerät, nicht der Prozessor. `tests/test_button.py` hält
+beide Grenzen fest.
+
+Ein Knopfdruck trägt keine Absicht: das Ziel bestimmt der Klassifizierer, und
+ein Trennblatt sticht ihn aus. Die FERTIGMELDUNG braucht dagegen eine feste
+Adresse — ohne `SCANNER_CALLER_TARGET_BUTTON` läuft der Scan durch, aber niemand
+erfährt davon. Abschaltbar mit `SCANNER_BUTTON_WATCH=false`.
+
 ## Tools
 
 | Tool | Purpose |
