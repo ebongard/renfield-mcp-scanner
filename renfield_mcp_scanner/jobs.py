@@ -58,10 +58,22 @@ EVENT_DELIVERED = "delivered"
 EVENT_FATAL = "fatal"
 EVENT_NO_ROUTE = "no_route"
 EVENT_GAVE_UP = "gave_up"
+#: Aufgegeben, nachdem die Adresse ÜBER DEN GANZEN ZEITRAUM nur blanke 404
+#: geantwortet hat. 🛑 Eigener Zustand, weil er NICHT wieder angefasst wird:
+#: `EVENT_GAVE_UP` bekommt bei jedem Dienststart ein frisches Budget, und das
+#: ist bei einer Fehlkonfiguration eine Verstärkung statt einer Rettung (s.
+#: `_blank_404_expired`).
+EVENT_GAVE_UP_404 = "gave_up_404"
 _EVENT_OPEN = frozenset({EVENT_PENDING, EVENT_RETRY})
 # Re-sent after a restart: still open, or given up during an outage that has
 # since ended — a restart is the cheapest moment to try once more.
+# 🛑 `EVENT_GAVE_UP_404` steht hier bewusst NICHT.
 _EVENT_RESEND_ON_RESTART = _EVENT_OPEN | {EVENT_GAVE_UP}
+
+#: Kennung der Antwort, die ein Urteil braucht: 404 ohne das Merkmal der
+#: Anwendung. Steht im Datensatz und überlebt damit einen Neustart — ohne das
+#: wäre „seit wann" nach jedem Start wieder unbekannt.
+REFUSAL_UNMARKED_404 = "http_404_unmarked"
 
 # Answers that say "not now" rather than "no": the sender backs off, and honours
 # the receiver's Retry-After when it names one.
@@ -295,14 +307,18 @@ class JobEventNotifier:
             slot = self._slots[target.id] = asyncio.Semaphore(self._concurrency)
         return slot
 
-    async def send_once(self, job: dict, target: ScanTarget) -> tuple[str, float | None]:
-        """One attempt. Returns the event state and, for a "not now" answer, the
-        receiver's Retry-After in seconds (None when it named none)."""
+    async def send_once(
+        self, job: dict, target: ScanTarget,
+    ) -> tuple[str, float | None, str]:
+        """One attempt. Returns the event state, the receiver's Retry-After in
+        seconds for a "not now" answer (None when it named none), and a refusal
+        code for the one answer that needs a judgement later (a 404 without the
+        application's marker — see `REFUSAL_UNMARKED_404`); "" otherwise."""
         try:
             token = target.token()
         except MissingTokenError as exc:
             logger.error("job %s: %s", job["job_id"], exc)
-            return EVENT_FATAL, None
+            return EVENT_FATAL, None, ""
         headers = {"Authorization": f"Bearer {token}",
                    JOB_EVENT_CONTRACT_HEADER: SCANNER_JOB_EVENT_CONTRACT_VERSION}
         try:
@@ -313,15 +329,15 @@ class JobEventNotifier:
                                          headers=headers, json=self.payload(job))
         except httpx.HTTPError as exc:
             logger.info("job %s: event transport error: %s", job["job_id"], exc)
-            return EVENT_RETRY, None
+            return EVENT_RETRY, None, ""
         if 200 <= resp.status_code < 300:
-            return EVENT_DELIVERED, None
+            return EVENT_DELIVERED, None, ""
         if resp.status_code in (401, 403):
             # Anwendungsseitig und eindeutig: ein falsches Token oder eine
             # abgelehnte Berechtigung. Wiederholen kann beides nicht heilen.
             logger.error("job %s: event rejected with HTTP %s — not retrying",
                          job["job_id"], resp.status_code)
-            return EVENT_FATAL, None
+            return EVENT_FATAL, None, ""
         if resp.status_code == 404:
             # 🛑 NUR mit dem Merkmal der Anwendung endgültig. Dieselbe Zahl
             # kommt vom Ingress, wenn gerade kein Pod bereit ist — dann ist sie
@@ -330,18 +346,50 @@ class JobEventNotifier:
             if _ingest_is_switched_off(resp):
                 logger.error("job %s: event rejected with HTTP 404 (%s) — "
                              "not retrying", job["job_id"], INGEST_DISABLED_REASON)
-                return EVENT_FATAL, None
+                return EVENT_FATAL, None, ""
             # Bewusste Übergangsfolge: ein Renfield-Stand ohne das Merkmal lässt
             # uns bei abgeschaltetem Ingest den ganzen Wiederholungszeitraum
             # lang anfragen. Das ist die billigere Hälfte des Irrtums.
             logger.info("job %s: event got HTTP 404 WITHOUT %r — treated as "
                         "retryable (an ingress 404 during a rollout looks exactly "
                         "like this)", job["job_id"], INGEST_DISABLED_REASON)
-            return EVENT_RETRY, None
+            return EVENT_RETRY, None, REFUSAL_UNMARKED_404
         logger.info("job %s: event not accepted (HTTP %s)", job["job_id"], resp.status_code)
         retry_after = (_retry_after_seconds(resp)
                        if resp.status_code in _RETRY_AFTER_CODES else None)
-        return EVENT_RETRY, retry_after
+        return EVENT_RETRY, retry_after, ""
+
+    def _blank_404_expired(self, event: dict) -> bool:
+        """Hat diese Adresse den ganzen Zeitraum lang nur blanke 404 geantwortet?
+
+        🛑 DIE VERSTÄRKUNG, GEGEN DIE DAS GESCHRIEBEN IST (Review 2026-10-11)
+        =====================================================================
+        Seit die blanke 404 wiederholbar ist, ist der Zeitraum nicht auf
+        `job_event_retry_hours` begrenzt, sondern auf diese Spanne JE
+        DIENSTSTART: `EVENT_GAVE_UP` steht in `_EVENT_RESEND_ON_RESTART`, und
+        `JobManager.recover` gibt ein frisches Budget. Ein aufgegebenes
+        Ereignis verfällt erst nach `SCANNER_STAGING_RETENTION_DAYS` — bei
+        einer falschen `base_url` also rund 300 Versuche, nach jedem Start
+        erneut, bis zu 30 Tage. Vorher waren es EINE Fehlerzeile und Schluss.
+
+        Der Tausch bleibt richtig (Wiederholen ist der sichere Fehlerfall),
+        aber die Spanne muss über Neustarts hinweg gelten. Darum WANDUHR und
+        nicht die monotone Uhr: nur sie übersteht einen Neustart. Ein Sprung
+        (NTP, Zeitumstellung) verschiebt das Urteil um den Sprung — hinnehmbar,
+        weil der Fehlerfall dann höchstens etwas früher oder später endet.
+
+        Die Trennung selbst ist die Dauer: eine blanke 404 auf eine
+        konfigurierte Adresse ist entweder ein Rollout (Sekunden) oder ein
+        Konfigurationsfehler (für immer).
+        """
+        if event.get("last_refusal") != REFUSAL_UNMARKED_404:
+            return False
+        try:
+            seit = datetime.fromisoformat(str(event.get("refused_since")))
+        except (TypeError, ValueError):
+            return False  # kein lesbarer Zeitpunkt: weiter wiederholen
+        grenze = timedelta(hours=self._config.job_event_retry_hours)
+        return datetime.now() - seit >= grenze
 
     @staticmethod
     async def _persist(job: dict, store: JobStore) -> None:
@@ -368,10 +416,35 @@ class JobEventNotifier:
         horizon = self._config.job_event_retry_hours * 3600
         while True:
             event["attempts"] += 1
-            state, retry_after = await self.send_once(job, target)
+            state, retry_after, refusal = await self.send_once(job, target)
             event["state"] = state
+            if refusal:
+                event["last_refusal"] = refusal
+                # Der ERSTE Zeitpunkt, nicht der letzte: die Dauer ist das
+                # einzige, was einen Rollout (Sekunden) von einer falschen
+                # Adresse (für immer) trennt.
+                event.setdefault("refused_since", _now())
+            else:
+                # Selbstreinigend. Zwei Gründe: der Datensatz bleibt klein, und
+                # „zuletzt abgewiesen" meint wirklich die LETZTE Antwort — eine
+                # 503 nach einer blanken 404 ist ein Ausfall, kein Adressfehler.
+                event.pop("last_refusal", None)
+                event.pop("refused_since", None)
             await self._persist(job, store)
             if state != EVENT_RETRY:
+                return
+            if self._blank_404_expired(event):
+                event["state"] = EVENT_GAVE_UP_404
+                await self._persist(job, store)
+                logger.error(
+                    "job %s: %s has answered a BLANK HTTP 404 for more than %.1f h "
+                    "(%d attempts) — giving up for good, NOT retried after a "
+                    "restart either. A 404 that lasts this long is a misconfigured "
+                    "address (SCANNER_CALLER_TARGET_* → that target's base_url), not "
+                    "a rollout. Fix the address; this job's outcome is lost, later "
+                    "scans will report again.",
+                    job["job_id"], f"{target.base_url.rstrip('/')}{JOB_EVENT_PATH}",
+                    self._config.job_event_retry_hours, event["attempts"])
                 return
             if self._clock() - started >= horizon:
                 break

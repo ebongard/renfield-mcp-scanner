@@ -75,7 +75,21 @@ empty feeder. And OCR ran on the event loop, freezing the server for 12 s.
   for that second. 401/403 stay final: both arise in the application and are
   unambiguous. Transitional consequence, accepted deliberately: against a
   Renfield build that does not send the marker yet, a switched-off ingest is
-  retried for the whole retry horizon.
+  retried for the whole retry horizon — see the next bullet for what bounds it.
+- 🛑 **A blank 404 is retried for `SCANNER_JOB_EVENT_RETRY_HOURS` IN TOTAL, not
+  per service start.** Retrying is the safe side of the 404 split, but it
+  amplifies: `gave_up` events are re-sent on every start with a fresh attempt
+  budget and only expire with `SCANNER_STAGING_RETENTION_DAYS`, so a wrong
+  `base_url` in `SCANNER_CALLER_TARGET_<CALLER>` — which answers a blank 404,
+  indistinguishable from a rollout's — would be asked ~300 times per start for
+  up to 30 days, where it used to cost one ERROR line and stop (review finding
+  A1). The bound: the time of the FIRST blank 404 is written into the record
+  (`refused_since`, wall clock, so it survives a restart), and once the span is
+  exceeded the event settles as `gave_up_404` — a state that is never re-sent
+  again. The separator is the duration: a blank 404 on a configured address is
+  either a rollout (seconds) or a misconfiguration (forever). Any other answer
+  in between (a 503, a transport error) clears the judgement — whoever answers
+  503 is reachable, so the address is right.
 - **One scan at a time.** There is one feeder, so a second request while a scan
   runs gets the running job's id back.
 - **Restarts.** Job records live under `<staging>/jobs`. A restart closes cut-off

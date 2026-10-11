@@ -10,6 +10,7 @@ import inspect
 import json
 import threading
 import time
+from datetime import datetime, timedelta
 from types import SimpleNamespace
 
 import httpx
@@ -815,3 +816,136 @@ def test_unauthenticated_loopback_is_the_default_caller():
     no_state = SimpleNamespace(request_context=SimpleNamespace(
         request=SimpleNamespace(state=SimpleNamespace())))
     assert _caller(no_state) == "default"
+
+
+class TestDieWiederholungVerstaerktSichNichtUeberNEUSTARTS:
+    """🛑 Review-Befund A1 vom 2026-10-11.
+
+    Seit die blanke 404 wiederholbar ist, war der Zeitraum nicht auf
+    `job_event_retry_hours` begrenzt, sondern auf diese Spanne JE DIENSTSTART:
+    `EVENT_GAVE_UP` steht in `_EVENT_RESEND_ON_RESTART`, und `recover` gibt ein
+    frisches Budget (`attempts = 0`). Ein aufgegebenes Ereignis verfällt erst
+    nach `SCANNER_STAGING_RETENTION_DAYS`.
+
+    Fehlerfall: eine falsche `base_url` in `SCANNER_CALLER_TARGET_<CALLER>`
+    antwortet blanke 404, von einer Rollout-404 nicht unterscheidbar. VORHER
+    eine Fehlerzeile und Schluss; danach rund 300 Versuche über 24 h — und das
+    nach jedem Dienststart erneut, bis zu 30 Tage.
+
+    Die Trennung ist die DAUER: eine blanke 404 auf eine konfigurierte Adresse
+    ist entweder ein Rollout (Sekunden) oder ein Konfigurationsfehler (für
+    immer).
+    """
+
+    @staticmethod
+    def _blanke_404() -> httpx.Response:
+        return httpx.Response(404, text="404 page not found")
+
+    async def test_eine_dauerhafte_blanke_404_wird_ENDGUELTIG_aufgegeben(
+            self, tmp_path, monkeypatch):
+        """Der Zeitpunkt der ersten blanken 404 steht im Datensatz, also gilt
+        die Spanne über Neustarts hinweg. Hier liegt er 25 h zurück."""
+        monkeypatch.setenv("TOK_HH", "secret")
+        store, job = await _job(tmp_path)
+        job["event"]["last_refusal"] = j.REFUSAL_UNMARKED_404
+        job["event"]["refused_since"] = (
+            datetime.now() - timedelta(hours=25)).isoformat(timespec="seconds")
+        await store.save(job)
+        seen = []
+        notifier, sleeps = _notifier(tmp_path, [self._blanke_404()], seen)
+
+        await notifier.deliver(job, store)
+
+        gespeichert = await store.load(job["job_id"])
+        assert gespeichert["event"]["state"] == j.EVENT_GAVE_UP_404
+        assert len(seen) == 1 and sleeps == [], (
+            "nach dem Urteil darf kein weiterer Versuch folgen")
+        # 🛑 Und der Zeitpunkt der ERSTEN Abweisung darf sich dabei nicht
+        # erneuern. Täte er es (`=` statt `setdefault`), schöbe jede weitere
+        # 404 die Frist vor sich her, die Spanne liefe nie ab — und dieser
+        # Test wäre dann nicht nur in dieser Zeile rot, sondern in der oberen:
+        # das Urteil käme überhaupt nicht.
+        assert gespeichert["event"]["refused_since"].startswith(
+            job["event"]["refused_since"][:16])
+
+    async def test_ein_so_aufgegebenes_ereignis_wird_beim_neustart_NICHT_wiederholt(
+            self, tmp_path, monkeypatch):
+        """Die Hälfte, die die Verstärkung tatsächlich begrenzt."""
+        monkeypatch.setenv("TOK_HH", "secret")
+        store = j.JobStore(tmp_path)
+        await store.save({"job_id": "4" * 32, "status": j.DONE, "caller": "household",
+                          "result": {"ok": True},
+                          "event": {"state": j.EVENT_GAVE_UP_404, "attempts": 300,
+                                    "last_refusal": j.REFUSAL_UNMARKED_404}})
+        seen = []
+        notifier, _ = _notifier(tmp_path, [], seen)
+        manager = j.JobManager(store, run_scan=None, notifier=notifier)
+
+        bericht = await manager.recover()
+        await manager.wait_idle()
+
+        assert bericht["resent"] == 0
+        assert seen == [], "kein frisches Budget für eine falsche Adresse"
+        assert (await store.load("4" * 32))["event"]["state"] == j.EVENT_GAVE_UP_404
+
+    async def test_ein_gewoehnlicher_ausfall_wird_beim_neustart_WEITER_wiederholt(
+            self, tmp_path, monkeypatch):
+        """🛑 Negativkontrolle, und sie ist die wichtigere: ein Backend, das 24 h
+        lang 503 antwortet, ist ein ECHTER Ausfall. Dessen Fertigmeldung muss
+        der Neustart weiter aufnehmen — genau dafür steht `EVENT_GAVE_UP` in
+        der Neustart-Menge."""
+        monkeypatch.setenv("TOK_HH", "secret")
+        store = j.JobStore(tmp_path)
+        await store.save({"job_id": "5" * 32, "status": j.DONE, "caller": "household",
+                          "result": {"ok": True},
+                          "event": {"state": j.EVENT_GAVE_UP, "attempts": 300}})
+        seen = []
+        notifier, _ = _notifier(tmp_path, [200], seen)
+        manager = j.JobManager(store, run_scan=None, notifier=notifier)
+
+        bericht = await manager.recover()
+        await manager.wait_idle()
+
+        assert bericht["resent"] == 1 and len(seen) == 1
+        assert (await store.load("5" * 32))["event"]["state"] == j.EVENT_DELIVERED
+
+    async def test_eine_FRISCHE_blanke_404_wird_normal_wiederholt(
+            self, tmp_path, monkeypatch):
+        """🛑 Negativkontrolle zum Urteil. Die Rollout-404 ist Sekunden alt —
+        sie muss den gewöhnlichen Weg gehen, sonst ist der Fix aus #1391
+        wieder weg."""
+        monkeypatch.setenv("TOK_HH", "secret")
+        store, job = await _job(tmp_path)
+        seen = []
+        notifier, sleeps = _notifier(
+            tmp_path, [self._blanke_404(), self._blanke_404(), 200], seen)
+
+        await notifier.deliver(job, store)
+
+        gespeichert = await store.load(job["job_id"])
+        assert gespeichert["event"]["state"] == j.EVENT_DELIVERED
+        assert len(seen) == 3 and sleeps == [2.0, 4.0]
+        assert "last_refusal" not in gespeichert["event"], (
+            "eine zugestellte Meldung trägt keine Abweisung mehr")
+
+    async def test_eine_503_nach_einer_404_loescht_das_urteil(
+            self, tmp_path, monkeypatch):
+        """🛑 Die zweite Negativkontrolle zum Urteil, und die feinere: wer nach
+        der blanken 404 mit 503 antwortet, IST erreichbar — die Adresse stimmt
+        also. Bliebe die Abweisung stehen, würde ein echter Ausfall nach einem
+        Rollout als Adressfehler verurteilt."""
+        monkeypatch.setenv("TOK_HH", "secret")
+        store, job = await _job(tmp_path)
+        job["event"]["last_refusal"] = j.REFUSAL_UNMARKED_404
+        job["event"]["refused_since"] = (
+            datetime.now() - timedelta(hours=25)).isoformat(timespec="seconds")
+        await store.save(job)
+        seen = []
+        notifier, sleeps = _notifier(tmp_path, [503, 200], seen, retry_hours=24.0)
+
+        await notifier.deliver(job, store)
+
+        gespeichert = await store.load(job["job_id"])
+        assert gespeichert["event"]["state"] == j.EVENT_DELIVERED
+        assert len(seen) == 2
+        assert "refused_since" not in gespeichert["event"]
