@@ -25,6 +25,27 @@ SCANNER_JOB_EVENT_CONTRACT_VERSION = "1"
 JOB_EVENT_CONTRACT_HEADER = "X-Scanner-Job-Contract"
 JOB_EVENT_PATH = "/api/scanner/job-event"
 
+#: Das Merkmal, an dem eine 404 DER ANWENDUNG erkennbar ist. Renfield antwortet
+#: bei abgeschaltetem Ordner-Ingest mit
+#: ``{"detail": {"reason": "folder_ingest_disabled", "message": "…"}}``.
+#:
+#: 🛑 Eine 404 OHNE dieses Merkmal ist WIEDERHOLBAR, nicht endgültig. Am
+#: 2026-10-11 während eines Backend-Rollouts gemessen: auf zwei richtig
+#: wiederholte 503 folgte eine 404 von Traefik, und die verwarf die
+#: Fertigmeldung endgültig. Dass sie nicht von der Anwendung kam, ist belegt —
+#: `FOLDER_INGEST_ENABLED` stand auf `true`, und im Backend-Protokoll steht zu
+#: dieser Sekunde keine `job-event`-Zeile, nur Startmeldungen. Die Zahl allein
+#: trägt die Unterscheidung also nicht; das Merkmal tut es.
+#:
+#: Dieses Merkmal ist von der Versionsregel oben AUSGENOMMEN, und zwar bewusst:
+#: es steht nur im FEHLERRUMPF und ist in beide Richtungen verträglich. Ein
+#: Renfield ohne das Merkmal lässt den Absender wiederholen (siehe
+#: `JobEventNotifier.send_once`), ein Scanner ohne diese Prüfung verwirft wie
+#: bisher. Ein Versionssprung würde dagegen auf JEDER Meldung eine
+#: Abweichungswarnung auf beiden Seiten erzeugen, solange nur eine Seite
+#: ausgerollt ist — Lärm ohne Erkenntnis.
+INGEST_DISABLED_REASON = "folder_ingest_disabled"
+
 
 class IngestStatus(str, Enum):
     """The backend's 4-state reply. All four arrive as HTTP 200."""

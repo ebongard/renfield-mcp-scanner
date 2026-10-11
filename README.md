@@ -63,6 +63,19 @@ empty feeder. And OCR ran on the event loop, freezing the server for 12 s.
   never a poll. The caller is known from its Bearer token.
   `SCANNER_CALLER_TARGET_<CALLER>` names that caller's target, and the target's
   base URL and push token carry the event.
+- 🛑 **A 404 is final only when it carries the application's marker.** The
+  application answers `{"detail": {"reason": "folder_ingest_disabled", …}}` when
+  folder ingest is off, and only THAT 404 stops the retries
+  (`contract.INGEST_DISABLED_REASON`). Every other 404 — a bare body, a `detail`
+  that is a string, a foreign reason — is retryable, because the same number
+  comes from the ingress while no pod is ready. Measured on 2026-10-11 during a
+  rollout: two 503 were retried correctly, then a Traefik 404 discarded the
+  completion event for good. That it never reached the application is proven —
+  `FOLDER_INGEST_ENABLED` was `true` and the backend log has no `job-event` line
+  for that second. 401/403 stay final: both arise in the application and are
+  unambiguous. Transitional consequence, accepted deliberately: against a
+  Renfield build that does not send the marker yet, a switched-off ingest is
+  retried for the whole retry horizon.
 - **One scan at a time.** There is one feeder, so a second request while a scan
   runs gets the running job's id back.
 - **Restarts.** Job records live under `<staging>/jobs`. A restart closes cut-off

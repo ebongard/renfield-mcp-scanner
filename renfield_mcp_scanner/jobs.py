@@ -36,6 +36,7 @@ import httpx
 
 from .config import Config, MissingTokenError, ScanTarget
 from .contract import (
+    INGEST_DISABLED_REASON,
     JOB_EVENT_CONTRACT_HEADER,
     JOB_EVENT_PATH,
     SCANNER_JOB_EVENT_CONTRACT_VERSION,
@@ -100,6 +101,26 @@ def _equal_jitter(delay: float) -> float:
     """Somewhere in the upper half of the delay. After an outage every open event
     would otherwise retry in lockstep and hit the recovering instance together."""
     return random.uniform(delay / 2, delay)
+
+
+def _ingest_is_switched_off(resp: httpx.Response) -> bool:
+    """Trägt diese 404 das Merkmal der ANWENDUNG — oder kam sie vom Ingress?
+
+    🛑 Nur mit Merkmal ist eine 404 endgültig. Begründung und Messung stehen bei
+    `INGEST_DISABLED_REASON`; hier steht nur, wie streng gelesen wird: ein
+    unlesbarer Rumpf, ein `detail` als Text statt als Objekt, ein fremder Grund
+    — jeder dieser Fälle bedeutet NICHT abgeschaltet und damit wiederholbar.
+    Das ist die sichere Seite: eine überflüssige Wiederholung kostet Anfragen,
+    eine falsch verworfene Fertigmeldung kostet den Abschluss eines Scans.
+    """
+    try:
+        body = resp.json()
+    except ValueError:
+        return False
+    if not isinstance(body, dict):
+        return False
+    detail = body.get("detail")
+    return isinstance(detail, dict) and detail.get("reason") == INGEST_DISABLED_REASON
 
 
 def _retry_after_seconds(resp: httpx.Response) -> float | None:
@@ -295,12 +316,28 @@ class JobEventNotifier:
             return EVENT_RETRY, None
         if 200 <= resp.status_code < 300:
             return EVENT_DELIVERED, None
-        if resp.status_code in (401, 403, 404):
-            # A bad token, or an instance without the route (older backend,
-            # feature off): retrying cannot fix either, it only hammers.
+        if resp.status_code in (401, 403):
+            # Anwendungsseitig und eindeutig: ein falsches Token oder eine
+            # abgelehnte Berechtigung. Wiederholen kann beides nicht heilen.
             logger.error("job %s: event rejected with HTTP %s — not retrying",
                          job["job_id"], resp.status_code)
             return EVENT_FATAL, None
+        if resp.status_code == 404:
+            # 🛑 NUR mit dem Merkmal der Anwendung endgültig. Dieselbe Zahl
+            # kommt vom Ingress, wenn gerade kein Pod bereit ist — dann ist sie
+            # das Gegenteil von endgültig. Messung: siehe
+            # `INGEST_DISABLED_REASON`.
+            if _ingest_is_switched_off(resp):
+                logger.error("job %s: event rejected with HTTP 404 (%s) — "
+                             "not retrying", job["job_id"], INGEST_DISABLED_REASON)
+                return EVENT_FATAL, None
+            # Bewusste Übergangsfolge: ein Renfield-Stand ohne das Merkmal lässt
+            # uns bei abgeschaltetem Ingest den ganzen Wiederholungszeitraum
+            # lang anfragen. Das ist die billigere Hälfte des Irrtums.
+            logger.info("job %s: event got HTTP 404 WITHOUT %r — treated as "
+                        "retryable (an ingress 404 during a rollout looks exactly "
+                        "like this)", job["job_id"], INGEST_DISABLED_REASON)
+            return EVENT_RETRY, None
         logger.info("job %s: event not accepted (HTTP %s)", job["job_id"], resp.status_code)
         retry_after = (_retry_after_seconds(resp)
                        if resp.status_code in _RETRY_AFTER_CODES else None)
