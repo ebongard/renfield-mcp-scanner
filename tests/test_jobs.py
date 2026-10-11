@@ -392,6 +392,36 @@ class TestEine404IstNurMitMerkmalEndgueltig:
             "state": j.EVENT_DELIVERED, "attempts": 4}
         assert len(sleeps) == 3
 
+    async def test_der_GENERISCHE_grund_zaehlt_NICHT_als_merkmal(
+            self, tmp_path, monkeypatch):
+        """🛑 Review-Befund B2, und die Entscheidung dazu.
+
+        Auf der Renfield-Seite heisst dieselbe Tatsache an zwei anderen Routen
+        ``reason: "feature_disabled"`` (`folder_ingest.py`, `email_ingest.py`)
+        — dort generisch für zwei verschiedene Funktionen und an einer **503**,
+        also an einer WIEDERHOLBAREN Antwort. Unser Merkmal reist an einer 404
+        und trägt die ENDGÜLTIGKEIT.
+
+        Die beiden gleichzuziehen würde genau die Verwechslung bauen, gegen die
+        #1391 geschrieben ist: ein Grund, den fremde Routen für „nicht jetzt"
+        benutzen, darf nie „für immer" bedeuten. Hängt ihn eine dritte Route
+        einmal an eine 404, verschwindet dort still eine Fertigmeldung.
+        """
+        monkeypatch.setenv("TOK_HH", "secret")
+        store, job = await _job(tmp_path)
+        seen = []
+        notifier, _ = _notifier(tmp_path, [
+            httpx.Response(404, json={"detail": {"reason": "feature_disabled",
+                                                 "message": "Folder ingest is disabled"}}),
+            200,
+        ], seen)
+
+        await notifier.deliver(job, store)
+
+        assert (await store.load(job["job_id"]))["event"]["state"] == j.EVENT_DELIVERED, (
+            "der generische Grund darf keine Fertigmeldung verwerfen")
+        assert contract.INGEST_DISABLED_REASON != "feature_disabled"
+
     def test_das_merkmal_ist_der_VERTRAG_nicht_ein_wort_in_jobs_py(self):
         """Beide Seiten prüfen gegen dieselbe Zeichenkette. Stünde sie als
         Literal in `jobs.py`, wäre genau das die Stelle, an der sie bei der
@@ -948,7 +978,8 @@ class TestDieWiederholungVerstaerktSichNichtUeberNEUSTARTS:
 
         gespeichert = await store.load(job["job_id"])
         assert gespeichert["event"]["state"] == j.EVENT_DELIVERED
-        assert len(seen) == 2
+        assert len(seen) == 2 and sleeps == [2.0], (
+            "die 503 muss den gewöhnlichen Weg gehen, nicht das Urteil erben")
         assert "refused_since" not in gespeichert["event"]
 
 

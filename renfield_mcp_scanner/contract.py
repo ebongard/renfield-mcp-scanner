@@ -37,6 +37,24 @@ JOB_EVENT_PATH = "/api/scanner/job-event"
 #: dieser Sekunde keine `job-event`-Zeile, nur Startmeldungen. Die Zahl allein
 #: trägt die Unterscheidung also nicht; das Merkmal tut es.
 #:
+#: 🛑 NICHT ZU VERWECHSELN mit ``reason: "feature_disabled"``. Dieselbe Tatsache
+#: hat auf der Renfield-Seite einen zweiten Namen (`api/routes/folder_ingest.py`
+#: und `api/routes/email_ingest.py`), und das bleibt mit Absicht so:
+#:
+#: * ``feature_disabled`` ist GENERISCH — zwei verschiedene Routen für zwei
+#:   verschiedene Funktionen antworten damit — und es reist mit **503**. Es ist
+#:   eine Erläuterung an einer WIEDERHOLBAREN Antwort, kein Endgültigkeitszeichen.
+#: * Dieses Merkmal hier reist mit **404** und trägt die ENDGÜLTIGKEIT: es ist
+#:   die einzige Zeichenkette im System, auf die ein Absender eine Fertigmeldung
+#:   verwirft.
+#:
+#: Die beiden gleichzuziehen würde genau die Verwechslung bauen, gegen die
+#: #1391 geschrieben ist: ein generischer Grund, den heute zwei fremde Routen
+#: für „nicht jetzt" benutzen, dürfte nie „für immer" bedeuten. Käme eine
+#: dritte Route auf die Idee, ihn an eine 404 zu hängen, verschwände dort still
+#: eine Fertigmeldung. Ein Test hält darum fest, dass ``feature_disabled`` als
+#: Merkmal NICHT zählt.
+#:
 #: Dieses Merkmal ist von der Versionsregel oben AUSGENOMMEN, und zwar bewusst:
 #: es steht nur im FEHLERRUMPF und ist in beide Richtungen verträglich. Ein
 #: Renfield ohne das Merkmal lässt den Absender wiederholen (siehe

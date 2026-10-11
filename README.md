@@ -73,7 +73,11 @@ empty feeder. And OCR ran on the event loop, freezing the server for 12 s.
   completion event for good. That it never reached the application is proven —
   `FOLDER_INGEST_ENABLED` was `true` and the backend log has no `job-event` line
   for that second. 401/403 stay final: both arise in the application and are
-  unambiguous. Transitional consequence, accepted deliberately: against a
+  unambiguous. 🛑 The marker is NOT `reason: "feature_disabled"` — that one is
+  generic (two other Renfield routes use it for two different features) and it
+  rides on a **503**, i.e. on a retryable answer. A reason that foreign routes
+  use for "not now" must never mean "forever"; a test pins that the scanner
+  refuses it as a marker (review finding B2). Transitional consequence, accepted deliberately: against a
   Renfield build that does not send the marker yet, a switched-off ingest is
   retried for the whole retry horizon — see the next bullet for what bounds it.
 - 🛑 **A blank 404 is retried for `SCANNER_JOB_EVENT_RETRY_HOURS` IN TOTAL, not
