@@ -278,10 +278,17 @@ async def _serve() -> None:
         )
         # 🛑 Und ein Abschluss-Rückruf, weil die starke Referenz oben Pythons
         # „Task exception was never retrieved" UNTERDRÜCKT: die Warnung feuert
-        # erst beim Aufräumen, und aufgeräumt wird hier nie. Ohne diesen
-        # Rückruf ist das Ende der Aufgabe strukturell unsichtbar — genau so
-        # ist der Knopf eine Woche lang stumm gestorben. Dasselbe Muster löst
-        # `jobs.py` mit `add_done_callback` seit Beginn richtig.
+        # erst, wenn das Task-Objekt aufgeräumt wird, und `button_task` hält es
+        # bis zum Serverende fest. Ohne diesen Rückruf ist das Ende der Aufgabe
+        # strukturell unsichtbar — genau so ist der Knopf eine Woche lang stumm
+        # gestorben.
+        #
+        # Der Unterschied zu `jobs.py._spawn`, wo das Muster nicht beisst:
+        # dort gibt `add_done_callback(self._tasks.discard)` die Referenz beim
+        # Abschluss FREI, und erst dadurch kann Pythons eingebaute Warnung
+        # überhaupt feuern. Protokolliert wird dort nichts — wer das erwartet,
+        # sucht umsonst. Eine langlebige Aufgabe wie diese kann die Referenz
+        # aber nicht freigeben, also muss sie selbst melden.
         button_task.add_done_callback(_button_task_done)
         logger.info("Knopfwächter aktiv — der blaue Knopf startet einen Scan")
     else:

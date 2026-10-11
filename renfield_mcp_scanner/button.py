@@ -82,7 +82,9 @@ REDISCOVER_AFTER = 3   # so viele Fehlschläge in Folge, bevor neu gesucht wird
 #: „Knopf tot" würde „Gerät fest". Darum bindet die Wartezeit an dieselbe
 #: Grenze und wird nie kleiner.
 RESTART_BACKOFF = REDISCOVER_AFTER * ERROR_BACKOFF
-RESTART_BACKOFF_MAX = 60.0  # Deckel: im Dauerfehler eine Zeile je Minute
+RESTART_BACKOFF_MAX = 60.0  # Deckel: im Dauerfehler eine MELDUNG je Minute —
+#: dieselbe Frequenz wie der Sensorfehlerpfad, aber nicht dasselbe Volumen:
+#: dort eine `warning`-Zeile, hier eine vollständige Rückverfolgung.
 
 
 async def watch_button(
@@ -95,6 +97,18 @@ async def watch_button(
     max_iterations: int | None = None,
 ) -> None:
     """Warte auf den Knopf und starte einen Scan. Läuft bis zum Abbruch.
+
+    🛑 NICHT DIREKT ALS TASK ABSETZEN — dafür gibt es `supervise_button`.
+    Dieser Satz steht hier, weil der vorige („Läuft bis zum Abbruch.") die
+    Fehlverdrahtung getragen hat: er klingt wie eine Zusage, dass die Schleife
+    nicht endet. Sie fängt aber nur die VORGESEHENEN Fehler; eine
+    unvorhergesehene Ausnahme beendet sie, und als nackte Task bleibt das
+    unsichtbar. Am 2026-10-04 hat das den blauen Knopf sieben Tage lahmgelegt.
+
+    🛑 Ein NEUSTART dieser Funktion ist nicht billig: sie beginnt mit
+    ``device = None`` und löst damit eine vollständige SANE-Suche aus, solange
+    ``config.device`` leer ist (produktiv ist es das). Wer sie neu startet,
+    muss die Grenze aus `RESTART_BACKOFF` einhalten — s. dort.
 
     ``max_iterations`` gibt es allein für Tests — ohne Abbruchbedingung wäre
     eine Endlosschleife nicht prüfbar.
@@ -205,9 +219,12 @@ async def supervise_button(
     * Ein Absturz der Schleife wird mit Rückverfolgung protokolliert und die
       Schleife NEU GESTARTET. Ein Knopf, der nach einem Papierstau dauerhaft
       tot bleibt, ist schlimmer als einer, der es nochmal versucht.
-    * Die Wartezeit wächst (5 s, gedeckelt auf 60 s). Im Dauerfehler bleibt es
-      bei einer Zeile je Minute — derselbe Takt, den der Sensorfehlerpfad
-      schon hat, damit ein Absturzkreis das Protokoll nicht flutet.
+    * Die Wartezeit wächst, beginnt bei `RESTART_BACKOFF` und ist auf
+      `RESTART_BACKOFF_MAX` gedeckelt. Im Dauerfehler bleibt es bei einer
+      MELDUNG je Minute — dieselbe Frequenz wie im Sensorfehlerpfad, aber nicht
+      dasselbe Volumen: dort steht eine `warning`-Zeile, hier eine vollständige
+      Rückverfolgung. Das ist der Preis dafür, die Ursache überhaupt zu
+      erfahren, und er ist bewusst bezahlt.
 
     `asyncio.CancelledError` wird NICHT behandelt: sie ist das geordnete Ende
     beim Herunterfahren und muss durchlaufen. Sie ist in Python ≥ 3.8 keine

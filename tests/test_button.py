@@ -208,10 +208,13 @@ class TestDieAufsichtHaeltDenWaechterAmLeben:
         assert all(s <= button.RESTART_BACKOFF_MAX for s in schlaf)
 
     async def test_ein_gesunder_waechter_wird_NICHT_neu_gestartet(self):
-        """🛑 Negativkontrolle, und die wichtigere Hälfte.
+        """🛑 Negativkontrolle. Eine saubere Rückkehr darf keinen Neustart
+        auslösen.
 
-        Startete die Aufsicht auch ohne Absturz neu, liefe der teure Sensortakt
-        unkontrolliert mehrfach — und der Test oben wäre trotzdem grün.
+        Der Pfad ist im Betrieb unerreichbar (`watch_button` kehrt ohne
+        `max_iterations` nie zurück) — geprüft wird er trotzdem, weil ein
+        künftiger Umbau ihn einbauen könnte und der Knopf dann still
+        abgeschaltet wäre.
         """
         laeufe = 0
 
@@ -230,6 +233,44 @@ class TestDieAufsichtHaeltDenWaechterAmLeben:
         )
         assert laeufe == 1, "ohne Absturz darf nicht neu gestartet werden"
         assert schlaf == [], "und es darf dafür nicht gewartet werden"
+
+    async def test_es_laeuft_NIE_mehr_als_eine_schleife(self):
+        """🛑 Die Gefahr, die der Docstring oben vorher nur BEHAUPTET hat.
+
+        Im Review aufgefallen: „liefe der teure Sensortakt mehrfach" war gar
+        nicht geprüft — und mit sequenziellem `await` strukturell auch nicht
+        möglich. Also wird jetzt gemessen statt behauptet: der Attrappen-Wächter
+        zählt die Gleichzeitigkeit mit und gibt dabei an die Ereignisschleife
+        zurück, damit eine zweite Schleife überhaupt laufen KÖNNTE.
+
+        Das fängt den Umbau, der den Neustart als eigene Task absetzt — dann
+        liefen zwei Sensortakte parallel, und laut Modulkopf setzt genau das
+        den Scanner fest.
+        """
+        import asyncio as _asyncio
+
+        gleichzeitig = 0
+        hoechststand = 0
+
+        async def crashing(_config, _start_job):
+            nonlocal gleichzeitig, hoechststand
+            gleichzeitig += 1
+            hoechststand = max(hoechststand, gleichzeitig)
+            await _asyncio.sleep(0)      # Rückgabe an die Ereignisschleife
+            gleichzeitig -= 1
+            raise RuntimeError("weg")
+
+        async def sleep(_s):
+            await _asyncio.sleep(0)      # auch hier zurückgeben
+
+        await button.supervise_button(
+            _Config(), None, watcher=crashing, sleep=sleep, clock=lambda: 0.0,
+            max_restarts=5,
+        )
+        assert hoechststand == 1, (
+            f"es darf nie mehr als eine Wächter-Schleife laufen, gemessen: "
+            f"{hoechststand}"
+        )
 
     async def test_abbruch_laeuft_durch(self):
         """`asyncio.CancelledError` ist das geordnete Ende beim Herunterfahren.
