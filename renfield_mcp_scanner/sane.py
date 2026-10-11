@@ -24,6 +24,15 @@ _TERMINATOR = "out of documents"
 _BENIGN = re.compile(r"out of documents|rounded value")
 
 
+#: Zeitgrenze der beiden BILLIGEN Abfragen: Gerätesuche (`scanimage -f`) und
+#: Sensorgruppe (`scanimage -A`). Als benannte Konstante, weil der Knopfwächter
+#: sie in seine Lebendigkeitsgrenze EINRECHNET (`button.LIVENESS_WORST_GAP`):
+#: eine hängende Abfrage zieht die Lücke zwischen zwei Durchläufen um bis zu
+#: diese Spanne, ohne dass etwas kaputt ist. Stünde die Zahl an beiden Stellen
+#: einzeln, liefe sie beim nächsten Umbau auseinander.
+PROBE_TIMEOUT = 60.0
+
+
 class ScannerError(RuntimeError):
     """A scanner fault. Carries the device's own message."""
 
@@ -86,7 +95,7 @@ async def find_device(preferred: str = "") -> str:
     """Resolve the scanner device name. Empty preference -> first Fujitsu."""
     if preferred:
         return preferred
-    _, out = await _run("-f", "%d%n", timeout=60)
+    _, out = await _run("-f", "%d%n", timeout=PROBE_TIMEOUT)
     for line in out.splitlines():
         if "fujitsu" in line.lower():
             return line.strip()
@@ -95,7 +104,7 @@ async def find_device(preferred: str = "") -> str:
 
 async def read_sensors(device: str) -> Sensors:
     """Read the live sensor group. Cheap, and the basis of scanner_status."""
-    _, out = await _run("-d", device, "-A", timeout=60)
+    _, out = await _run("-d", device, "-A", timeout=PROBE_TIMEOUT)
     raw: dict[str, str] = {}
     for m in re.finditer(r"^\s+--([a-z0-9-]+)\[?=?.*?\[(\w+)\]\s*\[hardware\]", out, re.M):
         raw[m.group(1)] = m.group(2)

@@ -204,9 +204,18 @@ eine funktionale MCP-Probe, die das Werkzeug ohnehin aufrufen kann.
 
 Die Falle, die dabei zählt: die Task EXISTIERTE in diesen sieben Tagen. Jede
 Auskunft, die daraus abgeleitet wäre, hätte „läuft" gemeldet. Also setzt die
-Schleife bei jedem Durchlauf selbst eine Marke, und nur deren Alter entscheidet
-(`LIVENESS_STALE_AFTER`, abgeleitet aus `LIVENESS_FACTOR * RESTART_BACKOFF_MAX`
-— der längsten vorgesehenen Lücke, nämlich der Wartezeit der Aufsicht).
+Schleife bei jedem Durchlauf selbst eine Marke, und nur deren Alter entscheidet.
+
+Die Grenze ist ABGELEITET, Summand für Summand:
+`LIVENESS_WORST_GAP = RESTART_BACKOFF_MAX + 2 × sane.PROBE_TIMEOUT +
+ERROR_BACKOFF` — die Wartezeit der Aufsicht nach einem Absturz, plus eine
+hängende Gerätesuche, plus ein hängender Sensorabruf, plus die Wartezeit am
+Ende des Durchlaufs. Darauf `LIVENESS_FACTOR` (zwei), damit ein einzelner
+unvorhergesehener Halt noch keinen Fehlalarm ergibt. Die beiden SANE-Grenzen
+sind der Grund und standen in der ersten Fassung nicht in der Rechnung
+(Review-Befund L2): ein hängendes `scanimage` zieht die Lücke über die
+Wartezeit der Aufsicht hinaus, ohne dass der Wächter steht. Die Zeitgrenze
+steht darum nur EINMAL als Zahl, in `sane.PROBE_TIMEOUT`.
 
 🛑 Die Marke steht am **ENDE** jedes Durchlaufs, auch im Sensorfehlerpfad:
 sie bedeutet „ein Durchlauf ist VOLLENDET", nicht „die Schleife wurde

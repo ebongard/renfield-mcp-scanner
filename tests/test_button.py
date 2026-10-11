@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import pytest
 
-from renfield_mcp_scanner import button
+from renfield_mcp_scanner import button, sane
 from renfield_mcp_scanner.sane import Sensors
 
 
@@ -567,18 +567,48 @@ class TestDerWaechterbefundHaengtAnEinerZEITMARKE:
         assert befund["restarts_total"] == 3
         assert befund["restart_streak"] == 3
 
-    def test_die_grenze_ist_aus_dem_laengsten_TAKT_abgeleitet(self):
-        """🛑 Eine geratene Zahl driftet beim nächsten Umbau. Die längste
-        vorgesehene Lücke zwischen zwei Durchläufen ist die Wartezeit der
-        Aufsicht — in ihr dreht sich die Schleife tatsächlich nicht."""
+    def test_die_grenze_ist_aus_der_laengsten_LUECKE_abgeleitet(self):
+        """🛑 Eine geratene Zahl driftet beim nächsten Umbau.
+
+        Review-Befund L2 vom 2026-10-11: die erste Fassung leitete allein aus
+        der Wartezeit der Aufsicht ab und liess die beiden SANE-Zeitgrenzen
+        aus. Ein hängendes `scanimage` zieht die Lücke aber über diese
+        Wartezeit hinaus, OHNE dass der Wächter steht — und genau dann hätte
+        das Feld einen Ausfall erfunden.
+        """
         assert (button.LIVENESS_STALE_AFTER
-                == button.LIVENESS_FACTOR * button.RESTART_BACKOFF_MAX)
+                == button.LIVENESS_FACTOR * button.LIVENESS_WORST_GAP)
+        assert button.LIVENESS_WORST_GAP == (
+            button.RESTART_BACKOFF_MAX + 2 * sane.PROBE_TIMEOUT
+            + button.ERROR_BACKOFF), "die Summanden müssen die Lücke ERGEBEN"
         for takt in (button.IDLE_INTERVAL, button.ARMED_INTERVAL,
                      button.ERROR_BACKOFF, button.RESTART_BACKOFF,
                      button.RESTART_BACKOFF_MAX):
             assert button.LIVENESS_STALE_AFTER > takt, (
                 f"die Grenze muss den Takt {takt} s vertragen, sonst ist jeder "
                 f"normale Zustand ein Fehlalarm")
+
+    def test_eine_haengende_SANE_abfrage_erfindet_keinen_ausfall(self):
+        """Der schlimmste vorgesehene Fall in einer Zahl: ein Neustart der
+        Aufsicht, danach eine hängende Gerätesuche UND ein hängender
+        Sensorabruf, beide bis an ihre Zeitgrenze. Dabei ist nichts kaputt —
+        also darf die Grenze darüber liegen."""
+        schlimmste_luecke = (button.RESTART_BACKOFF_MAX + 2 * sane.PROBE_TIMEOUT
+                             + button.ERROR_BACKOFF)
+        assert button.LIVENESS_STALE_AFTER > schlimmste_luecke, (
+            f"{button.LIVENESS_STALE_AFTER} s Grenze gegen {schlimmste_luecke} s "
+            f"Lücke — eine hängende Abfrage würde als toter Wächter gelesen")
+
+    def test_die_SANE_grenze_steht_nur_EINMAL_als_zahl(self):
+        """Die Ableitung ist nur so gut wie ihre Quelle: lesen die Abfragen
+        ihre Zeitgrenze nicht aus derselben Konstante, läuft die Rechnung beim
+        nächsten Umbau still auseinander."""
+        import inspect
+
+        for funktion in (sane.find_device, sane.read_sensors):
+            quelle = inspect.getsource(funktion)
+            assert "timeout=PROBE_TIMEOUT" in quelle, (
+                f"{funktion.__name__} muss die benannte Konstante benutzen")
 
     def test_die_marke_kommt_aus_der_SCHLEIFE_nicht_aus_einer_task(self):
         """Strukturprüfung auf die Invariante aus #3: setzt die Schleife die

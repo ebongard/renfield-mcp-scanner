@@ -87,19 +87,33 @@ RESTART_BACKOFF_MAX = 60.0  # Deckel: im Dauerfehler eine MELDUNG je Minute —
 #: dieselbe Frequenz wie der Sensorfehlerpfad, aber nicht dasselbe Volumen:
 #: dort eine `warning`-Zeile, hier eine vollständige Rückverfolgung.
 
-#: Faktor auf die längste vorgesehene Lücke zwischen zwei Durchläufen. Drei,
-#: damit EINE lange Lücke noch keinen Befund ergibt: eine Gerätesuche und ein
-#: Sensorabruf tragen je bis zu 60 s Zeitgrenze (`sane._run`), und ein
-#: schlafender oder ausgestöpselter Scanner ist der NORMALFALL auf einem
-#: Arbeitsplatzrechner.
-LIVENESS_FACTOR = 3
+#: Die längste Lücke zwischen zwei VOLLENDETEN Durchläufen, in der nichts
+#: kaputt ist. 🛑 ABGELEITET, Summand für Summand — eine geratene Zahl driftet,
+#: und die erste Fassung hat genau hier zwei Posten übersehen (Review
+#: 2026-10-11):
+#:
+#:   `RESTART_BACKOFF_MAX`   die Aufsicht wartet nach einem Absturz, und in
+#:                           dieser Spanne dreht sich die Schleife wirklich nicht
+#: + `sane.PROBE_TIMEOUT`    die Gerätesuche darf so lange hängen …
+#: + `sane.PROBE_TIMEOUT`    … und der Sensorabruf danach ebenso
+#: + `ERROR_BACKOFF`         die Wartezeit am Ende des Durchlaufs (der längste
+#:                           der drei Takte)
+#:
+#: Die beiden SANE-Grenzen sind der Grund: ein hängendes `scanimage` zieht die
+#: Lücke über die Wartezeit der Aufsicht hinaus, ohne dass der Wächter steht.
+#: `IDLE_INTERVAL` und `ARMED_INTERVAL` liegen unter `ERROR_BACKOFF` und sind
+#: damit mitgedeckt.
+LIVENESS_WORST_GAP = (RESTART_BACKOFF_MAX + 2 * sane.PROBE_TIMEOUT + ERROR_BACKOFF)
+#: Sicherheitsfaktor auf diese Lücke. Zwei, damit EIN unvorhergesehener
+#: zusätzlicher Halt noch keinen Fehlalarm ergibt: ein ausgestöpselter oder
+#: schlafender Scanner ist der NORMALFALL auf einem Arbeitsplatzrechner, und
+#: ein Fehlalarm darauf macht die Alarmierung unbrauchbar. Der Preis ist die
+#: Erkennungsdauer — gegen einen Ausfall, der sieben Tage unbemerkt blieb, ist
+#: sie belanglos.
+LIVENESS_FACTOR = 2
 #: Ab dieser Lücke gilt die Zeitmarke als veraltet und der Wächter als nicht am
-#: Leben. 🛑 ABGELEITET, nicht gewählt: `RESTART_BACKOFF_MAX` ist die längste
-#: vorgesehene Lücke überhaupt — in ihr läuft die Schleife tatsächlich nicht,
-#: weil die Aufsicht zwischen zwei Neustarts wartet. Alles Kürzere
-#: (`IDLE_INTERVAL`, `ARMED_INTERVAL`, `ERROR_BACKOFF`, `RESTART_BACKOFF`)
-#: liegt darunter und ist damit mitgedeckt.
-LIVENESS_STALE_AFTER = LIVENESS_FACTOR * RESTART_BACKOFF_MAX
+#: Leben.
+LIVENESS_STALE_AFTER = LIVENESS_FACTOR * LIVENESS_WORST_GAP
 
 #: Ab so vielen Neustarts in Folge ist der Wächter nicht „am Leben", sondern in
 #: einem ABSTURZKREIS. Zwei genügen, weil die Aufsicht die Folge selbst schon
