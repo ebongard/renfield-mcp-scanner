@@ -156,3 +156,250 @@ class TestSurvival:
         f.result = {"ok": False, "busy": True, "message": "läuft schon"}
         await f.run(1)
         assert len(f.jobs) == 1     # versucht, und ruhig hingenommen
+
+
+class TestDieAufsichtHaeltDenWaechterAmLeben:
+    """🛑 Der Ausfall vom 2026-10-11: eine unvorhergesehene Ausnahme beendete
+    die Wächter-Aufgabe, und weil `server.py` sie in einer starken Referenz
+    hielt, ohne sie abzuwarten, unterdrückte das Pythons eingebaute Warnung.
+
+    Gemessen: nach dem Papierstau vom 04.10. schrieb der Wächter SIEBEN TAGE
+    keine Zeile. Sein Fehlerpfad drosselt auf eine Warnung je Minute — ein
+    dauerhaft fehlendes Gerät hätte Tausende erzeugt. Es waren null.
+    """
+
+    async def test_ein_absturz_startet_die_schleife_neu(self):
+        laeufe = 0
+
+        async def crashing(_config, _start_job):
+            nonlocal laeufe
+            laeufe += 1
+            raise RuntimeError("unvorhergesehen")
+
+        schlaf: list[float] = []
+
+        async def sleep(s):
+            schlaf.append(s)
+
+        await button.supervise_button(
+            _Config(), None, watcher=crashing, sleep=sleep, max_restarts=3,
+        )
+        assert laeufe == 3, "die Schleife muss nach einem Absturz neu anlaufen"
+        assert schlaf == [button.RESTART_BACKOFF, button.RESTART_BACKOFF * 2], (
+            f"die Wartezeit muss wachsen, war {schlaf}"
+        )
+
+    async def test_die_wartezeit_ist_gedeckelt(self):
+        """Ohne Deckel würde ein langer Absturzkreis beliebig träge; mit Deckel
+        bleibt es bei einer Zeile je Minute — derselbe Takt wie im
+        Sensorfehlerpfad."""
+        async def crashing(_config, _start_job):
+            raise RuntimeError("dauerhaft")
+
+        schlaf: list[float] = []
+
+        async def sleep(s):
+            schlaf.append(s)
+
+        await button.supervise_button(
+            _Config(), None, watcher=crashing, sleep=sleep, max_restarts=40,
+        )
+        assert max(schlaf) == button.RESTART_BACKOFF_MAX
+        assert all(s <= button.RESTART_BACKOFF_MAX for s in schlaf)
+
+    async def test_ein_gesunder_waechter_wird_NICHT_neu_gestartet(self):
+        """🛑 Negativkontrolle. Eine saubere Rückkehr darf keinen Neustart
+        auslösen.
+
+        Der Pfad ist im Betrieb unerreichbar (`watch_button` kehrt ohne
+        `max_iterations` nie zurück) — geprüft wird er trotzdem, weil ein
+        künftiger Umbau ihn einbauen könnte und der Knopf dann still
+        abgeschaltet wäre.
+        """
+        laeufe = 0
+
+        async def healthy(_config, _start_job):
+            nonlocal laeufe
+            laeufe += 1
+            return None          # wie `watch_button` mit max_iterations
+
+        schlaf: list[float] = []
+
+        async def sleep(s):
+            schlaf.append(s)
+
+        await button.supervise_button(
+            _Config(), None, watcher=healthy, sleep=sleep, max_restarts=5,
+        )
+        assert laeufe == 1, "ohne Absturz darf nicht neu gestartet werden"
+        assert schlaf == [], "und es darf dafür nicht gewartet werden"
+
+    async def test_es_laeuft_NIE_mehr_als_eine_schleife(self):
+        """🛑 Die Gefahr, die der Docstring oben vorher nur BEHAUPTET hat.
+
+        Im Review aufgefallen: „liefe der teure Sensortakt mehrfach" war gar
+        nicht geprüft — und mit sequenziellem `await` strukturell auch nicht
+        möglich. Also wird jetzt gemessen statt behauptet: der Attrappen-Wächter
+        zählt die Gleichzeitigkeit mit und gibt dabei an die Ereignisschleife
+        zurück, damit eine zweite Schleife überhaupt laufen KÖNNTE.
+
+        Das fängt den Umbau, der den Neustart als eigene Task absetzt — dann
+        liefen zwei Sensortakte parallel, und laut Modulkopf setzt genau das
+        den Scanner fest.
+        """
+        import asyncio as _asyncio
+
+        gleichzeitig = 0
+        hoechststand = 0
+
+        async def crashing(_config, _start_job):
+            nonlocal gleichzeitig, hoechststand
+            gleichzeitig += 1
+            hoechststand = max(hoechststand, gleichzeitig)
+            await _asyncio.sleep(0)      # Rückgabe an die Ereignisschleife
+            gleichzeitig -= 1
+            raise RuntimeError("weg")
+
+        async def sleep(_s):
+            await _asyncio.sleep(0)      # auch hier zurückgeben
+
+        await button.supervise_button(
+            _Config(), None, watcher=crashing, sleep=sleep, clock=lambda: 0.0,
+            max_restarts=5,
+        )
+        assert hoechststand == 1, (
+            f"es darf nie mehr als eine Wächter-Schleife laufen, gemessen: "
+            f"{hoechststand}"
+        )
+
+    async def test_abbruch_laeuft_durch(self):
+        """`asyncio.CancelledError` ist das geordnete Ende beim Herunterfahren.
+        Fängt die Aufsicht sie, hängt der Dienst beim Beenden."""
+        import asyncio as _asyncio
+
+        async def cancelled(_config, _start_job):
+            raise _asyncio.CancelledError()
+
+        with pytest.raises(_asyncio.CancelledError):
+            await button.supervise_button(
+                _Config(), None, watcher=cancelled, max_restarts=1,
+            )
+
+    async def test_nach_einem_gesunden_lauf_beginnt_die_staffelung_neu(self):
+        """Die Wartezeit soll die AKTUELLE Unruhe abbilden.
+
+        Ohne Rücksetzung erbt ein Dienst, der monatelang läuft und dreimal
+        abstürzt, dauerhaft den Deckel von 60 s — und die Zählung in der Meldung
+        wirft Monate zusammen. Hier läuft der Wächter zwischen den Abstürzen
+        länger als der Deckel, also muss die Staffelung wieder bei 5 s anfangen.
+        """
+        # 🛑 Der gesunde Lauf muss MITTENDRIN liegen, nicht am Anfang. Meine
+        # erste Fassung prüfte den ERSTEN Absturz — dort steht der Zähler
+        # ohnehin auf 0, die Rücksetzung war also wirkungslos und der Test
+        # blieb auch ohne sie grün. Die Negativkontrolle hat das aufgedeckt.
+        #
+        # Folge der Laufdauern: kurz, kurz, LANG, kurz, … Die Uhr wird zweimal
+        # je Lauf abgefragt (Start und Absturz) und wiederholt die letzte Dauer.
+        uhr = _Uhr([1.0, 1.0, button.RESTART_BACKOFF_MAX + 1, 1.0])
+
+        async def crashing(_config, _start_job):
+            raise RuntimeError("weg")
+
+        schlaf: list[float] = []
+
+        async def sleep(s):
+            schlaf.append(s)
+
+        await button.supervise_button(
+            _Config(), None, watcher=crashing, sleep=sleep, clock=uhr,
+            max_restarts=4,
+        )
+        B = button.RESTART_BACKOFF
+        # kurz   -> 1. Neustart        -> 1*B
+        # kurz   -> 2. Neustart        -> 2*B
+        # LANG   -> Zähler zurück, 1.  -> 1*B   <- der Beweis
+        # kurz   -> 2.                 -> 2*B
+        # kurz   -> 3.                 -> 3*B
+        assert schlaf == [B, 2 * B, B, 2 * B, 3 * B], (
+            f"nach einem gesunden Lauf muss die Staffelung neu beginnen, war {schlaf}"
+        )
+
+    async def test_ein_absturzkreis_erbt_die_staffelung_WEITER(self):
+        """🛑 Negativkontrolle zur Rücksetzung: stürzt der Wächter SOFORT wieder
+        ab, darf der Zähler NICHT zurückgesetzt werden — sonst hämmert ein
+        Absturzkreis dauerhaft im 5-Sekunden-Takt und flutet das Protokoll.
+        """
+        async def crashing(_config, _start_job):
+            raise RuntimeError("dauerhaft")
+
+        schlaf: list[float] = []
+
+        async def sleep(s):
+            schlaf.append(s)
+
+        await button.supervise_button(
+            _Config(), None, watcher=crashing, sleep=sleep, clock=lambda: 0.0,
+            max_restarts=4,
+        )
+        B = button.RESTART_BACKOFF
+        assert schlaf == [B, 2 * B, 3 * B], f"Staffelung muss wachsen, war {schlaf}"
+
+
+class _Uhr:
+    """Monotone Uhr mit vorgegebenen Laufdauern, je Lauf zwei Abfragen."""
+
+    def __init__(self, laufdauern: list[float]):
+        self.laufdauern = list(laufdauern)
+        self.aufrufe = 0
+
+    def __call__(self) -> float:
+        lauf = self.aufrufe // 2
+        start_abfrage = self.aufrufe % 2 == 0
+        self.aufrufe += 1
+        if start_abfrage:
+            return 0.0
+        return self.laufdauern[min(lauf, len(self.laufdauern) - 1)]
+
+
+class TestDieAufsichtUmgehtDieSelbstbremseNICHT:
+    """🛑 Der Befund aus dem Review vom 2026-10-11, und er wog schwerer als der
+    Fehler, gegen den die Aufsicht gebaut ist.
+
+    Ein neu gestarteter `watch_button` beginnt mit `device = None` und ruft
+    deshalb sofort `find_device`. Produktiv ist `config.device` LEER
+    (`SCANNER_DEVICE` setzt niemand), also läuft dort `scanimage -f` — die
+    vollständige SANE-Suche, die den USB-Anschluss belegt. Gemessen am
+    2026-10-11 am laufenden Dienst: 4,3 s zwischen „Knopfwächter aktiv" und
+    „Gerät …".
+
+    `watch_button` bremst sich dafür selbst: neu gesucht wird erst nach
+    `REDISCOVER_AFTER` Fehlschlägen, also höchstens alle
+    `REDISCOVER_AFTER * ERROR_BACKOFF` Sekunden — eine Grenze aus der Messung,
+    die den Scanner am 2026-09-25 FESTGESETZT hat. Eine Aufsicht, die
+    schneller neu startet, umgeht genau diese Bremse: aus „Knopf tot" würde
+    „Gerät fest, dafür lautes Protokoll".
+    """
+
+    async def test_die_wartezeit_unterbietet_die_suchbremse_nie(self):
+        async def crashing(_config, _start_job):
+            raise RuntimeError("dauerhaft")
+
+        schlaf: list[float] = []
+
+        async def sleep(s):
+            schlaf.append(s)
+
+        await button.supervise_button(
+            _Config(), None, watcher=crashing, sleep=sleep, clock=lambda: 0.0,
+            max_restarts=6,
+        )
+        bremse = button.REDISCOVER_AFTER * button.ERROR_BACKOFF
+        assert min(schlaf) >= bremse, (
+            f"kein Neustart darf schneller kommen als die Suchbremse von "
+            f"{bremse} s — gemessen wurde {min(schlaf)} s"
+        )
+
+    async def test_die_konstante_ist_an_die_bremse_GEBUNDEN_nicht_geraten(self):
+        """Eine gleich grosse Zahl wäre Zufall und driftet beim nächsten Umbau
+        auseinander. Die Wartezeit muss AUS der Bremse abgeleitet sein."""
+        assert button.RESTART_BACKOFF == button.REDISCOVER_AFTER * button.ERROR_BACKOFF

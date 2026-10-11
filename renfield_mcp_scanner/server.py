@@ -171,6 +171,36 @@ async def retry_pending_scans(stage_id: str = "") -> dict:
     return await t.retry_pending_scans(config, staging, stage_id=stage_id)
 
 
+def _button_task_done(task: "asyncio.Task") -> None:
+    """Das Ende des Knopfwächters protokollieren — es war vorher unsichtbar.
+
+    Der Fall, auf den es ankommt: `task.exception()` ist gesetzt. Solange die
+    Aufgabe in einer starken Referenz lebt und niemand sie abwartet, holt
+    Python die Ausnahme NIE ab, und die eingebaute Warnung „Task exception was
+    never retrieved" feuert erst beim Aufräumen — also nie. Am 2026-10-11
+    gemessen: der blaue Knopf war sieben Tage ohne Wirkung, und im 12-MB-
+    Protokoll stand dazu keine Zeile.
+
+    `supervise_button` fängt die Ausnahmen der Schleife selbst ab; dieser
+    Rückruf ist die zweite Lage darunter und greift, wenn die AUFSICHT endet —
+    durch einen Fehler in ihr, oder durch eine `BaseException`.
+    """
+    if task.cancelled():
+        # Geordnetes Herunterfahren (`finally` in `_serve`), kein Befund.
+        return
+    exc = task.exception()
+    if exc is not None:
+        logger.error(
+            "Knopfwächter endgültig beendet (%r) — der blaue Knopf wirkt nicht "
+            "mehr, bis der Dienst neu startet", exc, exc_info=exc,
+        )
+    else:
+        logger.warning(
+            "Knopfwächter ist ohne Fehler beendet — der blaue Knopf wirkt "
+            "nicht mehr, bis der Dienst neu startet",
+        )
+
+
 async def _serve() -> None:
     global _config, _staging, _jobs
     _config = load_config()
@@ -224,15 +254,42 @@ async def _serve() -> None:
     # Der Knopfwächter läuft NEBEN dem Server, nicht in dessen Lifespan: ein
     # Knopfdruck muss auch dann wirken, wenn gerade kein Agent verbunden ist —
     # das ist ja sein Sinn. Als Task, damit ein Fehler dort den Server nicht
-    # mitreisst; der Wächter fängt seine eigenen Fehler ohnehin ab.
+    # mitreisst.
+    #
+    # 🛑 Hier stand: „der Wächter fängt seine eigenen Fehler ohnehin ab." Das
+    # war der Satz, der den Ausfall vom 2026-10-04 unsichtbar gemacht hat —
+    # beim Lesen beruhigt er, und er stimmte nur für die VORGESEHENEN Fehler.
+    # Eine unvorhergesehene Ausnahme beendete die Aufgabe, und niemand erfuhr
+    # davon. Der Wächter fängt jetzt wirklich alles ab, aber nicht, weil es
+    # hier behauptet wird, sondern weil `supervise_button` und der
+    # Abschluss-Rückruf unten es erzwingen.
     button_task = None
     if _config.button_watch:
-        from .button import watch_button
+        from .button import supervise_button
 
+        # 🛑 `supervise_button`, NICHT `watch_button` direkt: eine
+        # unvorhergesehene Ausnahme in der Schleife beendete die Aufgabe sonst
+        # endgültig. Am 2026-10-11 gemessen: nach dem Papierstau vom 04.10.
+        # war der blaue Knopf sieben Tage ohne Wirkung. Begründung im
+        # Docstring dort.
         button_task = asyncio.create_task(
-            watch_button(_config, lambda **kw: _job_manager().start(**kw)),
+            supervise_button(_config, lambda **kw: _job_manager().start(**kw)),
             name="scanner-button-watch",
         )
+        # 🛑 Und ein Abschluss-Rückruf, weil die starke Referenz oben Pythons
+        # „Task exception was never retrieved" UNTERDRÜCKT: die Warnung feuert
+        # erst, wenn das Task-Objekt aufgeräumt wird, und `button_task` hält es
+        # bis zum Serverende fest. Ohne diesen Rückruf ist das Ende der Aufgabe
+        # strukturell unsichtbar — genau so ist der Knopf eine Woche lang stumm
+        # gestorben.
+        #
+        # Der Unterschied zu `jobs.py._spawn`, wo das Muster nicht beisst:
+        # dort gibt `add_done_callback(self._tasks.discard)` die Referenz beim
+        # Abschluss FREI, und erst dadurch kann Pythons eingebaute Warnung
+        # überhaupt feuern. Protokolliert wird dort nichts — wer das erwartet,
+        # sucht umsonst. Eine langlebige Aufgabe wie diese kann die Referenz
+        # aber nicht freigeben, also muss sie selbst melden.
+        button_task.add_done_callback(_button_task_done)
         logger.info("Knopfwächter aktiv — der blaue Knopf startet einen Scan")
     else:
         logger.info("Knopfwächter AUS (SCANNER_BUTTON_WATCH)")

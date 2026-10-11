@@ -50,6 +50,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from typing import Any, Awaitable, Callable
 
 
@@ -66,6 +67,24 @@ IDLE_INTERVAL = 1.0    # ohne Papier: ~1 % eines Kerns
 ARMED_INTERVAL = 0.2   # mit Papier: fängt den ~200-ms-Impuls, s. Modulkopf
 ERROR_BACKOFF = 5.0    # Gerät weg/schläft: nicht im Leerlauf hämmern
 REDISCOVER_AFTER = 3   # so viele Fehlschläge in Folge, bevor neu gesucht wird
+#: Wartezeit nach einem Absturz der Schleife. 🛑 ABGELEITET, nicht gewählt:
+#: ein neu gestarteter `watch_button` beginnt mit `device = None` und ruft
+#: deshalb sofort `find_device`. `config.device` ist produktiv LEER
+#: (`SCANNER_DEVICE` setzt niemand), also läuft dort `scanimage -f` — der
+#: langsame Pfad, der alle SANE-Backends durchkämmt und dabei den USB-Anschluss
+#: belegt. Gemessen am 2026-10-11: 4,3 s je Suche.
+#:
+#: `watch_button` bremst sich dafür selbst: im Sensorfehlerpfad sucht es erst
+#: nach `REDISCOVER_AFTER` Fehlschlägen neu, also höchstens alle
+#: `REDISCOVER_AFTER * ERROR_BACKOFF` Sekunden. Diese Grenze stammt aus der
+#: Messung vom 2026-09-25, die den Scanner FESTGESETZT hat (s. Modulkopf).
+#: Eine Aufsicht, die schneller neu startet, umgeht genau diese Bremse — aus
+#: „Knopf tot" würde „Gerät fest". Darum bindet die Wartezeit an dieselbe
+#: Grenze und wird nie kleiner.
+RESTART_BACKOFF = REDISCOVER_AFTER * ERROR_BACKOFF
+RESTART_BACKOFF_MAX = 60.0  # Deckel: im Dauerfehler eine MELDUNG je Minute —
+#: dieselbe Frequenz wie der Sensorfehlerpfad, aber nicht dasselbe Volumen:
+#: dort eine `warning`-Zeile, hier eine vollständige Rückverfolgung.
 
 
 async def watch_button(
@@ -78,6 +97,18 @@ async def watch_button(
     max_iterations: int | None = None,
 ) -> None:
     """Warte auf den Knopf und starte einen Scan. Läuft bis zum Abbruch.
+
+    🛑 NICHT DIREKT ALS TASK ABSETZEN — dafür gibt es `supervise_button`.
+    Dieser Satz steht hier, weil der vorige („Läuft bis zum Abbruch.") die
+    Fehlverdrahtung getragen hat: er klingt wie eine Zusage, dass die Schleife
+    nicht endet. Sie fängt aber nur die VORGESEHENEN Fehler; eine
+    unvorhergesehene Ausnahme beendet sie, und als nackte Task bleibt das
+    unsichtbar. Am 2026-10-04 hat das den blauen Knopf sieben Tage lahmgelegt.
+
+    🛑 Ein NEUSTART dieser Funktion ist nicht billig: sie beginnt mit
+    ``device = None`` und löst damit eine vollständige SANE-Suche aus, solange
+    ``config.device`` leer ist (produktiv ist es das). Wer sie neu startet,
+    muss die Grenze aus `RESTART_BACKOFF` einhalten — s. dort.
 
     ``max_iterations`` gibt es allein für Tests — ohne Abbruchbedingung wäre
     eine Endlosschleife nicht prüfbar.
@@ -155,3 +186,92 @@ async def watch_button(
         # Der teure Takt NUR mit Papier im Einzug. Ohne Papier kann der Knopf
         # ohnehin nichts auslösen, was ankommt.
         await sleep(ARMED_INTERVAL if sensors.page_loaded else IDLE_INTERVAL)
+
+
+async def supervise_button(
+    config: Any,
+    start_job: Callable[..., Awaitable[dict]],
+    *,
+    watcher: Callable[..., Awaitable[None]] | None = None,
+    sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+    clock: Callable[[], float] = time.monotonic,
+    max_restarts: int | None = None,
+) -> None:
+    """Hält den Knopfwächter am Leben — und macht sein Ende HÖRBAR.
+
+    🛑 DER AUSFALL, GEGEN DEN DAS GESCHRIEBEN IST (2026-10-11)
+    ===========================================================
+    `watch_button` fängt alles, was in seiner Schleife vorgesehen ist: ein
+    fehlendes Gerät, einen Sensorfehler, einen fehlgeschlagenen Scan-Start.
+    Eine UNVORHERGESEHENE Ausnahme beendete die Aufgabe trotzdem — und zwar
+    lautlos, weil `server.py` sie in einer starken Referenz hielt, ohne sie
+    abzuwarten und ohne Abschluss-Rückruf: Pythons Warnung „Task exception was
+    never retrieved" feuert erst beim Aufräumen und kam deshalb NIE.
+
+    Gemessen am Haushalt: nach dem Papierstau vom 2026-10-04 15:24 hat der
+    Wächter **sieben Tage** keine Zeile mehr geschrieben. Sein Fehlerpfad
+    protokolliert gedrosselt eine Warnung je Minute — ein dauerhaft fehlendes
+    Gerät hätte also Tausende Zeilen erzeugt. Es waren null. Der blaue Knopf
+    war eine Woche tot, und nichts hat es gesagt.
+
+    Darum zwei Dinge, die vorher beide fehlten:
+
+    * Ein Absturz der Schleife wird mit Rückverfolgung protokolliert und die
+      Schleife NEU GESTARTET. Ein Knopf, der nach einem Papierstau dauerhaft
+      tot bleibt, ist schlimmer als einer, der es nochmal versucht.
+    * Die Wartezeit wächst, beginnt bei `RESTART_BACKOFF` und ist auf
+      `RESTART_BACKOFF_MAX` gedeckelt. Im Dauerfehler bleibt es bei einer
+      MELDUNG je Minute — dieselbe Frequenz wie im Sensorfehlerpfad, aber nicht
+      dasselbe Volumen: dort steht eine `warning`-Zeile, hier eine vollständige
+      Rückverfolgung. Das ist der Preis dafür, die Ursache überhaupt zu
+      erfahren, und er ist bewusst bezahlt.
+
+    `asyncio.CancelledError` wird NICHT behandelt: sie ist das geordnete Ende
+    beim Herunterfahren und muss durchlaufen. Sie ist in Python ≥ 3.8 keine
+    `Exception`, fällt also ohnehin nicht in den Fang unten — das steht hier,
+    damit es beim nächsten Umbau nicht versehentlich verlorengeht.
+
+    `watcher`, `clock` und `max_restarts` gibt es allein für Tests: ohne
+    Abbruchbedingung wäre eine Aufsicht über eine Endlosschleife nicht prüfbar.
+    Die Uhr ist EINGEHÄNGT und wird nicht global verbogen — ein Patch auf
+    `time.monotonic` gilt prozessweit, und die Ereignisschleife fragt sie
+    selbst ab; ein aufrufzahl-gekoppelter Doppelgänger wäre dann phasenver-
+    schoben, ohne dass es auffällt.
+    """
+    run = watcher if watcher is not None else watch_button
+    restarts = 0
+
+    while True:
+        begonnen = clock()
+        try:
+            await run(config, start_job)
+        except Exception:
+            # Die Wartezeit soll die AKTUELLE Unruhe abbilden, nicht die
+            # Lebensgeschichte des Dienstes. Hat der Wächter vor dem Absturz
+            # länger durchgehalten als der Deckel, war er dazwischen gesund —
+            # dann beginnt die Staffelung neu. Ohne das erbt ein Dienst, der
+            # monatelang läuft und dreimal abstürzt, dauerhaft die 60 Sekunden,
+            # und die Zählung in der Meldung („12. Neustart") führt in die Irre,
+            # weil sie Monate zusammenwirft.
+            if clock() - begonnen > RESTART_BACKOFF_MAX:
+                restarts = 0
+            restarts += 1
+            # `exception` statt `error`: ohne Rückverfolgung wäre die Ursache
+            # genau so unauffindbar wie vorher, nur eine Zeile lauter.
+            logger.exception(
+                "Knopfwächter abgestürzt — %d. Neustart, der blaue Knopf war "
+                "bis dahin ohne Wirkung", restarts,
+            )
+            if max_restarts is not None and restarts >= max_restarts:
+                return
+            await sleep(min(RESTART_BACKOFF * restarts, RESTART_BACKOFF_MAX))
+            continue
+
+        # Rückkehr OHNE Ausnahme. Im Betrieb läuft `watch_button` bis zum
+        # Abbruch, kommt also nie hierher; mit `max_iterations` (Tests) schon.
+        # Falls ein Umbau je einen stillen Rückweg einbaut, soll er auffallen.
+        logger.warning(
+            "Knopfwächter ist von selbst beendet — der blaue Knopf wirkt nicht "
+            "mehr, bis der Dienst neu startet",
+        )
+        return

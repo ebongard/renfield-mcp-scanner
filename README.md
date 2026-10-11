@@ -124,6 +124,33 @@ ein Trennblatt sticht ihn aus. Die FERTIGMELDUNG braucht dagegen eine feste
 Adresse — ohne `SCANNER_CALLER_TARGET_BUTTON` läuft der Scan durch, aber niemand
 erfährt davon. Abschaltbar mit `SCANNER_BUTTON_WATCH=false`.
 
+🛑 **Der Wächter läuft unter Aufsicht, und sein Ende ist hörbar.** Bis zum
+2026-10-11 lief er als nackte Task: `watch_button` fängt alles Vorgesehene ab
+(fehlendes Gerät, Sensorfehler, abgelehnter Scan-Start), aber eine
+UNVORHERGESEHENE Ausnahme beendete die Aufgabe endgültig — lautlos, weil die
+starke Referenz in `server.py` Pythons Warnung „Task exception was never
+retrieved" unterdrückte: die feuert erst beim Aufräumen, und aufgeräumt wurde
+nie. Gemessen am Haushalt: nach dem Papierstau vom 2026-10-04 15:24 schrieb der
+Wächter **sieben Tage** keine Zeile, obwohl sein Fehlerpfad gedrosselt eine
+Warnung je Minute protokolliert — ein fehlendes Gerät hätte Tausende erzeugt.
+Der blaue Knopf war eine Woche tot, und nichts hat es gesagt.
+
+Jetzt startet `supervise_button` die Schleife nach einem Absturz neu und ein
+Abschluss-Rückruf protokolliert jedes Ende der Aufgabe. `asyncio.CancelledError`
+läuft durch: sie ist das geordnete Herunterfahren.
+
+🛑 **Die Wartezeit ist ABGELEITET, nicht gewählt**:
+`RESTART_BACKOFF = REDISCOVER_AFTER * ERROR_BACKOFF` (15 s), wachsend, gedeckelt
+auf 60 s. Grund: ein neu gestarteter Wächter beginnt mit `device = None` und
+ruft sofort `find_device`. Produktiv ist `config.device` LEER — `SCANNER_DEVICE`
+setzt niemand —, also läuft dort `scanimage -f`, die vollständige SANE-Suche,
+die den USB-Anschluss belegt (am 2026-10-11 gemessen: 4,3 s je Suche). Eine
+Aufsicht, die schneller neu startet als die Bremse, die sich `watch_button`
+selbst setzt, würde genau den Takt erzeugen, der den Scanner am 2026-09-25
+festgesetzt hat. Aus „Knopf tot" würde „Gerät fest" — eine Reparatur, die
+schlimmer ist als der Fehler. Zwei Tests halten die Grenze UND ihre Ableitung
+fest; eine gleich große Zahl wäre Zufall und driftet beim nächsten Umbau.
+
 ## Tools
 
 | Tool | Purpose |
