@@ -51,6 +51,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from datetime import datetime
 from typing import Any, Awaitable, Callable
 
 
@@ -86,6 +87,155 @@ RESTART_BACKOFF_MAX = 60.0  # Deckel: im Dauerfehler eine MELDUNG je Minute —
 #: dieselbe Frequenz wie der Sensorfehlerpfad, aber nicht dasselbe Volumen:
 #: dort eine `warning`-Zeile, hier eine vollständige Rückverfolgung.
 
+#: Faktor auf die längste vorgesehene Lücke zwischen zwei Durchläufen. Drei,
+#: damit EINE lange Lücke noch keinen Befund ergibt: eine Gerätesuche und ein
+#: Sensorabruf tragen je bis zu 60 s Zeitgrenze (`sane._run`), und ein
+#: schlafender oder ausgestöpselter Scanner ist der NORMALFALL auf einem
+#: Arbeitsplatzrechner.
+LIVENESS_FACTOR = 3
+#: Ab dieser Lücke gilt die Zeitmarke als veraltet und der Wächter als nicht am
+#: Leben. 🛑 ABGELEITET, nicht gewählt: `RESTART_BACKOFF_MAX` ist die längste
+#: vorgesehene Lücke überhaupt — in ihr läuft die Schleife tatsächlich nicht,
+#: weil die Aufsicht zwischen zwei Neustarts wartet. Alles Kürzere
+#: (`IDLE_INTERVAL`, `ARMED_INTERVAL`, `ERROR_BACKOFF`, `RESTART_BACKOFF`)
+#: liegt darunter und ist damit mitgedeckt.
+LIVENESS_STALE_AFTER = LIVENESS_FACTOR * RESTART_BACKOFF_MAX
+
+#: Zustände, die `WatcherLiveness.report` meldet. `DEAD` ist der EINZIGE
+#: Befund — die anderen drei sind normale Zustände und dürfen keinen Alarm
+#: auslösen.
+WATCHER_OFF = "off"
+WATCHER_STARTING = "starting"
+WATCHER_ALIVE = "alive"
+WATCHER_DEAD = "dead"
+
+
+class WatcherLiveness:
+    """Lebt der Knopfwächter? Die Antwort hängt an einer ZEITMARKE.
+
+    🛑 DIE FALLE, UM DIE ES HIER GEHT (der Ausfall vom 2026-10-04, Issue #3)
+    ======================================================================
+    Die Task des Wächters EXISTIERTE sieben Tage lang, während der blaue Knopf
+    ohne Wirkung war: `server.py` hielt sie in einer starken Referenz, und die
+    Schleife darin war tot. Jede Auskunft, die aus dem Vorhandensein der Task
+    oder aus `task.done()` abgeleitet wäre, hätte in diesen sieben Tagen
+    „läuft" gemeldet. Darum wird hier NICHTS abgeleitet: die Schleife setzt bei
+    jedem Durchlauf selbst eine Zeitmarke, und nur deren Alter entscheidet.
+
+    Die Marke wird AM ANFANG jedes Durchlaufs gesetzt, auch im
+    Sensorfehlerpfad — die Aussage ist „die Schleife dreht sich", nicht „das
+    Gerät antwortet". Beides getrennt zu halten ist der Sinn der Sache: ein
+    ausgestöpselter oder schlafender Scanner ist ein NORMALER Zustand (der
+    Dienst läuft auf einem Arbeitsplatzrechner), ein stehender Wächter nicht.
+
+    Die Uhr ist monoton, nicht die Wanduhr: ein Sprung durch NTP oder
+    Zeitumstellung würde den Befund sonst erfinden. Schläft der Rechner,
+    erholt sich die Auskunft nach dem Aufwachen binnen eines Durchlaufs
+    (`IDLE_INTERVAL`) — eine Probe unmittelbar nach dem Aufwachen ist also der
+    einzige Fall, in dem sie kurz veraltet sein kann.
+
+    Die Wanduhr wird allein für die ANZEIGE geführt („seit wann"), nie für den
+    Vergleich.
+    """
+
+    def __init__(self, *, clock: Callable[[], float] = time.monotonic,
+                 wallclock: Callable[[], datetime] = datetime.now):
+        self._clock = clock
+        self._wallclock = wallclock
+        # Gegen DIESE Marke zählt „noch nie getickt". Ohne sie läse eine
+        # Verdrahtung, die den Wächter gar nicht erst startet, für immer als
+        # „startet gerade" — und das ist genau die Klasse Fehler, gegen die
+        # dieses Feld gebaut ist.
+        self._process_started = clock()
+        self._loop_started: float | None = None
+        self._loop_started_at: datetime | None = None
+        self._last_tick: float | None = None
+        self._restarts_total = 0
+        self._restart_streak = 0
+        self._device_readable: bool | None = None
+        self._device_detail = ""
+
+    # --- vom Wächter selbst gesetzt ---------------------------------------------
+
+    def loop_started(self) -> None:
+        self._loop_started = self._clock()
+        self._loop_started_at = self._wallclock()
+
+    def tick(self) -> None:
+        """Ein Schleifendurchlauf beginnt. Die einzige Quelle der Lebendigkeit."""
+        self._last_tick = self._clock()
+
+    def note_device(self, readable: bool, detail: str = "") -> None:
+        self._device_readable = readable
+        self._device_detail = detail
+
+    def note_restart(self, streak: int) -> None:
+        self._restarts_total += 1
+        self._restart_streak = streak
+
+    # --- Auskunft ---------------------------------------------------------------
+
+    def report(self, *, enabled: bool) -> dict:
+        """Der Wächterbefund für `scanner_status`.
+
+        `finding` ist die Hälfte, auf die eine funktionale Probe schaut: sie ist
+        NUR bei `dead` gesetzt. „Wächter lebt, Gerät nicht erreichbar" ist kein
+        Befund, und `SCANNER_BUTTON_WATCH=false` ist erst recht keiner.
+        """
+        if not enabled:
+            return self._shape(WATCHER_OFF, False, None, detail=(
+                "absichtlich aus (SCANNER_BUTTON_WATCH) — der blaue Knopf "
+                "startet keinen Scan, und das ist so gewollt"))
+        if self._last_tick is None:
+            # Noch kein Durchlauf. Die erste Gerätesuche dauert messbar (am
+            # 2026-10-11: 4,3 s), also ist das kurz nach dem Start normal.
+            age = self._clock() - self._process_started
+            if age <= LIVENESS_STALE_AFTER:
+                return self._shape(WATCHER_STARTING, False, age, detail=(
+                    "Wächter startet — noch kein Schleifendurchlauf"))
+            return self._shape(WATCHER_DEAD, True, age, detail=(
+                f"Wächter hat seit dem Start des Dienstes ({age:.0f} s) keinen "
+                f"einzigen Durchlauf gemeldet — er läuft nicht, der blaue Knopf "
+                f"wirkt nicht"))
+        age = self._clock() - self._last_tick
+        if age > LIVENESS_STALE_AFTER:
+            return self._shape(WATCHER_DEAD, True, age, detail=(
+                f"Wächter lebt NICHT: letzte Zeitmarke vor {age:.0f} s, Grenze "
+                f"{LIVENESS_STALE_AFTER:.0f} s. Der blaue Knopf wirkt nicht."))
+        if self._device_readable is False:
+            return self._shape(WATCHER_ALIVE, False, age, detail=(
+                f"Wächter lebt; Gerät nicht erreichbar — schlafend oder "
+                f"ausgestöpselt, ein normaler Zustand, kein Befund"
+                f"{f': {self._device_detail}' if self._device_detail else ''}"))
+        return self._shape(WATCHER_ALIVE, False, age, detail="Wächter lebt")
+
+    def _shape(self, state: str, finding: bool, age: float | None, *,
+               detail: str) -> dict:
+        return {
+            "state": state,
+            "finding": finding,
+            "last_tick_age_seconds": None if age is None else round(age, 1),
+            # Mitgeliefert, damit eine Probe die Grenze nicht nachbauen muss —
+            # eine zweite Zahl an einer zweiten Stelle läuft auseinander.
+            "stale_after_seconds": LIVENESS_STALE_AFTER,
+            "since": (self._loop_started_at.isoformat(timespec="seconds")
+                      if self._loop_started_at else None),
+            "restarts_total": self._restarts_total,
+            # Der Zähler aus der Absturzmeldung („%d. Neustart"): er beginnt
+            # nach einem gesunden Lauf neu, deshalb steht die Lebenssumme
+            # daneben.
+            "restart_streak": self._restart_streak,
+            "device_readable": self._device_readable,
+            "detail": detail,
+        }
+
+
+#: Ein Prozess, ein Scanner, ein Wächter — deshalb ein Modul-Exemplar. Sowohl
+#: `watch_button` als auch `supervise_button` greifen VORGABEWEISE darauf zu;
+#: Tests hängen ihr eigenes ein. 🛑 Wer eines der beiden mit einem eigenen
+#: Exemplar aufruft und das andere nicht, bekommt zwei halbe Auskünfte.
+LIVENESS = WatcherLiveness()
+
 
 async def watch_button(
     config: Any,
@@ -94,6 +244,7 @@ async def watch_button(
     read_sensors: Callable[[str], Awaitable[sane.Sensors]] = sane.read_sensors,
     find_device: Callable[[str], Awaitable[str]] = sane.find_device,
     sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+    liveness: WatcherLiveness | None = None,
     max_iterations: int | None = None,
 ) -> None:
     """Warte auf den Knopf und starte einen Scan. Läuft bis zum Abbruch.
@@ -118,9 +269,16 @@ async def watch_button(
     scanning = False
     iterations = 0
     errors = 0
+    leben = liveness if liveness is not None else LIVENESS
+    leben.loop_started()
 
     while max_iterations is None or iterations < max_iterations:
         iterations += 1
+        # 🛑 Die Zeitmarke steht HIER, am Anfang jedes Durchlaufs, und nicht im
+        # Erfolgszweig: die Aussage ist „die Schleife dreht sich". Stünde sie
+        # nach dem Sensorabruf, läse ein ausgestöpselter Scanner — der
+        # Normalfall auf einem Arbeitsplatzrechner — als toter Wächter.
+        leben.tick()
         try:
             if device is None:
                 device = await find_device(config.device)
@@ -139,6 +297,7 @@ async def watch_button(
             # Gedrosselt, damit ein dauerhaft fehlendes Gerät das Protokoll
             # nicht flutet: die erste Meldung sofort, danach eine je Minute.
             errors += 1
+            leben.note_device(False, str(exc))
             if errors == 1 or errors % int(60 / ERROR_BACKOFF) == 0:
                 logger.warning("Knopfwächter: Sensor nicht lesbar (%s) — "
                                "%d. Versuch seit dem letzten Erfolg", exc, errors)
@@ -156,6 +315,7 @@ async def watch_button(
             pressed_before = False
             await sleep(ERROR_BACKOFF)
             continue
+        leben.note_device(True)
         if errors:
             logger.info("Knopfwächter: Sensor wieder lesbar nach %d Fehlversuch(en)",
                         errors)
@@ -195,6 +355,7 @@ async def supervise_button(
     watcher: Callable[..., Awaitable[None]] | None = None,
     sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
     clock: Callable[[], float] = time.monotonic,
+    liveness: WatcherLiveness | None = None,
     max_restarts: int | None = None,
 ) -> None:
     """Hält den Knopfwächter am Leben — und macht sein Ende HÖRBAR.
@@ -231,6 +392,11 @@ async def supervise_button(
     `Exception`, fällt also ohnehin nicht in den Fang unten — das steht hier,
     damit es beim nächsten Umbau nicht versehentlich verlorengeht.
 
+    Die Neustarts werden an `WatcherLiveness` gemeldet, damit `scanner_status`
+    sie nennen kann — die Aufsicht ist die einzige Stelle, die sie kennt. Die
+    Lebendigkeit selbst meldet sie NICHT: die kommt aus der Schleife, sonst
+    wäre sie wieder aus dem Vorhandensein einer Task abgeleitet.
+
     `watcher`, `clock` und `max_restarts` gibt es allein für Tests: ohne
     Abbruchbedingung wäre eine Aufsicht über eine Endlosschleife nicht prüfbar.
     Die Uhr ist EINGEHÄNGT und wird nicht global verbogen — ein Patch auf
@@ -239,6 +405,7 @@ async def supervise_button(
     schoben, ohne dass es auffällt.
     """
     run = watcher if watcher is not None else watch_button
+    leben = liveness if liveness is not None else LIVENESS
     restarts = 0
 
     while True:
@@ -256,6 +423,7 @@ async def supervise_button(
             if clock() - begonnen > RESTART_BACKOFF_MAX:
                 restarts = 0
             restarts += 1
+            leben.note_restart(restarts)
             # `exception` statt `error`: ohne Rückverfolgung wäre die Ursache
             # genau so unauffindbar wie vorher, nur eine Zeile lauter.
             logger.exception(

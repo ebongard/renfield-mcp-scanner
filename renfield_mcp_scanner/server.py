@@ -69,7 +69,12 @@ async def list_scanners() -> dict:
 @mcp.tool()
 async def scanner_status() -> dict:
     """Report the scanner's real hardware state: ready, paper loaded, cover
-    open, power save, double feed, error code."""
+    open, power save, double feed, error code — plus whether the hardware
+    button's watcher is alive.
+
+    A scanner that is asleep or unplugged is a NORMAL state: this server runs on
+    an operator workstation. `button_watcher.finding` is true only when the
+    watcher itself is not running, which means the blue button does nothing."""
     config, _ = _ctx()
     return await t.scanner_status(config)
 

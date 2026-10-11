@@ -164,12 +164,44 @@ festgesetzt hat. Aus „Knopf tot" würde „Gerät fest" — eine Reparatur, di
 schlimmer ist als der Fehler. Zwei Tests halten die Grenze UND ihre Ableitung
 fest; eine gleich große Zahl wäre Zufall und driftet beim nächsten Umbau.
 
+🛑 **`scanner_status` sagt, ob der Wächter LEBT — und die Antwort hängt an
+einer Zeitmarke, nicht an einer Task.** Nach dem Ausfall oben ist der Tod des
+Wächters laut (eine ERROR-Zeile mit Rückverfolgung), aber er meldet sich nicht:
+eine Protokollzeile wartet, bis jemand nachsieht, und am 2026-10-04 hat sieben
+Tage niemand nachgesehen. Das Feld `button_watcher` macht ihn auffindbar — für
+eine funktionale MCP-Probe, die das Werkzeug ohnehin aufrufen kann.
+
+Die Falle, die dabei zählt: die Task EXISTIERTE in diesen sieben Tagen. Jede
+Auskunft, die daraus abgeleitet wäre, hätte „läuft" gemeldet. Also setzt die
+Schleife bei jedem Durchlauf selbst eine Marke, und nur deren Alter entscheidet
+(`LIVENESS_STALE_AFTER`, abgeleitet aus `LIVENESS_FACTOR * RESTART_BACKOFF_MAX`
+— der längsten vorgesehenen Lücke, nämlich der Wartezeit der Aufsicht).
+
+Die Marke steht am ANFANG jedes Durchlaufs, auch im Sensorfehlerpfad: die
+Aussage ist „die Schleife dreht sich", nicht „das Gerät antwortet". Ein
+schlafender oder ausgestöpselter Scanner ist der NORMALFALL auf einem
+Arbeitsplatzrechner und darf keinen Alarm erzeugen — darum trennt der Befund
+beides (`device_readable`), und `finding` ist **nur** bei `state: "dead"`
+gesetzt. `SCANNER_BUTTON_WATCH=false` meldet `state: "off"`, kein Befund. Und
+der Befund reitet auf der FEHLERANTWORT mit: `scanner_status` kehrt bei
+fehlendem Gerät früh zurück, und genau dann darf die Probe den Wächter nicht
+aus den Augen verlieren.
+
+| Feld | Bedeutung |
+|---|---|
+| `state` | `off` (absichtlich aus) · `starting` (noch kein Durchlauf) · `alive` · `dead` |
+| `finding` | Nur bei `dead` wahr — darauf schaut eine Probe |
+| `last_tick_age_seconds` / `stale_after_seconds` | Alter der Marke und die Grenze, gegen die verglichen wurde |
+| `since` | Wanduhrzeit, seit der die aktuelle Schleife läuft (nur Anzeige) |
+| `restarts_total` / `restart_streak` | Neustarts der Aufsicht insgesamt, und der Zähler aus ihrer Meldung |
+| `device_readable` | Ob der letzte Sensorabruf gelang — `false` ist KEIN Befund |
+
 ## Tools
 
 | Tool | Purpose |
 |---|---|
 | `list_scanners` | The attached scanner, its settings, configured targets |
-| `scanner_status` | Real hardware state from the SANE sensors — never inferred |
+| `scanner_status` | Real hardware state from the SANE sensors — never inferred — plus whether the button watcher is alive |
 | `scan_document` | START a scan job (feed, correct, route, push in the background); returns a `job_id` at once, `busy` while another scan runs |
 | `scan_job_status` | How a job stands or ended — for an explicit question, not for polling |
 | `list_pending_scans` | Scans held here awaiting a decision or a retry |
