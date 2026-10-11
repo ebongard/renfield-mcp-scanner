@@ -113,6 +113,13 @@ class Config(BaseModel):
     classifier_url: str = ""
     classifier_model: str = ""
     staging_retention_days: int = 30
+    # Ab welchem Alter ein wartender Stapel beim Start als WARNUNG gemeldet
+    # wird, statt nur als Zahl in der Startzeile. Ein Tag: ein Scan, den
+    # binnen eines Tages niemand abgeholt hat, ist ein Befund — ob er auf eine
+    # Entscheidung wartet oder aus einem Hardwarefehler stammt. 0 schaltet die
+    # Meldung ab. Vorgeschichte: ein Stapel mit `reason: scanner_fault` lag
+    # sieben Tage da und erschien bei jedem Start nur als „1 pending".
+    staging_warn_after_days: float = 1.0
     mcp_host: str = "127.0.0.1"
     mcp_port: int = 9093
     # Authenticates A CALLER TO THIS SERVER (the opposite direction from a
@@ -212,6 +219,7 @@ def load_config() -> Config:
         classifier_url=env("SCANNER_CLASSIFIER_URL", ""),
         classifier_model=env("SCANNER_CLASSIFIER_MODEL", ""),
         staging_retention_days=int(env("SCANNER_STAGING_RETENTION_DAYS", "30")),
+        staging_warn_after_days=float(env("SCANNER_PENDING_WARN_DAYS", "1")),
         mcp_host=env("SCANNER_MCP_HOST", "127.0.0.1"),
         mcp_port=int(env("SCANNER_MCP_PORT", "9093")),
         mcp_tokens=_caller_tokens(),

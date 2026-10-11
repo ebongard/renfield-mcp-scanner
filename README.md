@@ -98,6 +98,37 @@ empty feeder. And OCR ran on the event loop, freezing the server for 12 s.
   not retry in lockstep, and a `Retry-After` on 429/503 is honoured up to the
   5-minute backoff cap. The 24 h retry horizon is unchanged.
 
+## Ein wartender Stapel fordert eine ENTSCHEIDUNG an
+
+🛑 Gemessen am 2026-10-11: ein Stapel mit `reason: scanner_fault`
+(`Document feeder jammed`, zwei Seiten, 20 MB) lag **sieben Tage** im
+Zwischenlager. Zwei digitalisierte Seiten eines Briefes, die nie in einer
+Instanz ankamen — und gemeldet wurde er allein als Zahl in der Startzeile
+(„2 target(s), 1 pending, 0 purged"). Eine Zahl in einer INFO-Zeile liest sich
+wie ein Betriebszustand, nicht wie eine offene Entscheidung.
+
+`list_pending_scans` hat solche Stapel nie verschwiegen — `reason`, `detail`
+und `at` standen immer im Eintrag (nachgemessen, bevor etwas geändert wurde).
+Gefehlt haben das abgeleitete **Alter** (`age_seconds`) und die Unterscheidung
+vom vorgesehenen Wartezustand: `fault` ist wahr für alles, was nicht
+`unrouted` ist. Ein `unrouted`-Stapel wartet auf einen Menschen; ein
+Fehler-Stapel wartet darauf, dass jemand überhaupt von ihm erfährt. Beide
+abgeleiteten Felder stehen NACH den Metadaten aus der Datei, damit eine fremde
+`stage.json` das Urteil nicht umschreiben kann.
+
+Beim Start wird je Stapel, der länger als `SCANNER_PENDING_WARN_DAYS` (Vorgabe:
+ein Tag, `0` schaltet ab) liegt, eine **Warnung** mit Alter, Grund und
+Seitenzahl geschrieben. Je Start genau einmal — kein Takt, kein Wecker, sondern
+die Gelegenheit, bei der der Zustand ohnehin gelesen wird.
+
+**Die Aufbewahrung greift auch für Fehler-Stapel**, und zwar ohne Unterschied
+nach Grund: `SCANNER_STAGING_RETENTION_DAYS` ab der letzten Änderung des
+Verzeichnisses, also ab dem letzten `keep`. Ein Test hält das fest. 🛑 Gekehrt
+wird beim START des Dienstes — ein Dienst, der monatelang durchläuft, kehrt
+nicht aus. Auf dem Bedienrechner ist das in der Praxis kein Zeitraum (er
+schläft, startet neu, wird aktualisiert), aber es ist eine Annahme und keine
+Zusage.
+
 ## Separator sheets
 
 `generate_separator_sheets` renders one printable A4 sheet per configured
