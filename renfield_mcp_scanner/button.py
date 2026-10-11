@@ -101,13 +101,22 @@ LIVENESS_FACTOR = 3
 #: liegt darunter und ist damit mitgedeckt.
 LIVENESS_STALE_AFTER = LIVENESS_FACTOR * RESTART_BACKOFF_MAX
 
-#: Zustände, die `WatcherLiveness.report` meldet. `DEAD` ist der EINZIGE
-#: Befund — die anderen drei sind normale Zustände und dürfen keinen Alarm
-#: auslösen.
+#: Ab so vielen Neustarts in Folge ist der Wächter nicht „am Leben", sondern in
+#: einem ABSTURZKREIS. Zwei genügen, weil die Aufsicht die Folge selbst schon
+#: nach einem gesunden Lauf von mehr als `RESTART_BACKOFF_MAX` zurücksetzt: ein
+#: Zähler von zwei heisst also „erneut abgestürzt, bevor er einmal so lange
+#: durchgehalten hat". Ein einzelner Absturz nach Monaten Betrieb ist kein
+#: Befund — er steht als Rückverfolgung im Protokoll und die Schleife läuft.
+CRASHLOOP_RESTARTS = 2
+
+#: Zustände, die `WatcherLiveness.report` meldet. `DEAD` und `CRASHLOOP` sind
+#: die Befunde; `OFF` und `STARTING` sind normale Zustände und dürfen keinen
+#: Alarm auslösen.
 WATCHER_OFF = "off"
 WATCHER_STARTING = "starting"
 WATCHER_ALIVE = "alive"
 WATCHER_DEAD = "dead"
+WATCHER_CRASHLOOP = "crashloop"
 
 
 class WatcherLiveness:
@@ -152,6 +161,7 @@ class WatcherLiveness:
         self._last_tick: float | None = None
         self._restarts_total = 0
         self._restart_streak = 0
+        self._last_restart: float | None = None
         self._device_readable: bool | None = None
         self._device_detail = ""
 
@@ -162,7 +172,12 @@ class WatcherLiveness:
         self._loop_started_at = self._wallclock()
 
     def tick(self) -> None:
-        """Ein Schleifendurchlauf beginnt. Die einzige Quelle der Lebendigkeit."""
+        """Ein Schleifendurchlauf ist VOLLENDET — die Quelle der Lebendigkeit.
+
+        🛑 Vollendet, nicht begonnen. Am Anfang gesetzt hiess die Marke nur
+        „die Schleife wurde betreten", und genau das tut ein Absturzkreis
+        ständig; das Feld meldete dann `alive`, während der Knopf tot war.
+        """
         self._last_tick = self._clock()
 
     def note_device(self, readable: bool, detail: str = "") -> None:
@@ -172,6 +187,11 @@ class WatcherLiveness:
     def note_restart(self, streak: int) -> None:
         self._restarts_total += 1
         self._restart_streak = streak
+        # 🛑 Der ZEITPUNKT muss mit. Die Folge wird von der Aufsicht nur im
+        # Absturzzweig zurückgesetzt — ein Dienst, der zweimal beim Start
+        # abstürzt und danach monatelang läuft, trägt die Zwei für immer. Ohne
+        # Zeitpunkt läse er für immer als Absturzkreis.
+        self._last_restart = self._clock()
 
     # --- Auskunft ---------------------------------------------------------------
 
@@ -186,6 +206,19 @@ class WatcherLiveness:
             return self._shape(WATCHER_OFF, False, None, detail=(
                 "absichtlich aus (SCANNER_BUTTON_WATCH) — der blaue Knopf "
                 "startet keinen Scan, und das ist so gewollt"))
+        if self._in_crashloop():
+            # 🛑 VOR der Zeitmarke geprüft. Ein Absturzkreis betritt die
+            # Schleife ständig neu und kann dabei einzelne Durchläufe
+            # vollenden — die Marke allein läse ihn dann als `alive`, und
+            # genau das war der Befund vom 2026-10-11.
+            return self._shape(WATCHER_CRASHLOOP, True,
+                               None if self._last_tick is None
+                               else self._clock() - self._last_tick,
+                               detail=(
+                f"Wächter stürzt wiederholt ab: {self._restart_streak} Neustarts "
+                f"in Folge, der letzte vor {self._clock() - self._last_restart:.0f} s. "
+                f"Der blaue Knopf wirkt höchstens zeitweise. Ursache steht als "
+                f"Rückverfolgung im Protokoll."))
         if self._last_tick is None:
             # Noch kein Durchlauf. Die erste Gerätesuche dauert messbar (am
             # 2026-10-11: 4,3 s), also ist das kurz nach dem Start normal.
@@ -208,6 +241,19 @@ class WatcherLiveness:
                 f"ausgestöpselt, ein normaler Zustand, kein Befund"
                 f"{f': {self._device_detail}' if self._device_detail else ''}"))
         return self._shape(WATCHER_ALIVE, False, age, detail="Wächter lebt")
+
+    def _in_crashloop(self) -> bool:
+        """Stürzt der Wächter gerade WIEDERHOLT ab?
+
+        Zwei Bedingungen, und beide sind nötig: die Folge (sie wird von der
+        Aufsicht nach einem gesunden Lauf zurückgesetzt, ist also ein Mass für
+        die aktuelle Unruhe) UND die Frische des letzten Neustarts. Ohne die
+        zweite trägt ein Dienst, der zweimal beim Start abstürzte und danach
+        monatelang lief, den Befund für immer.
+        """
+        if self._last_restart is None or self._restart_streak < CRASHLOOP_RESTARTS:
+            return False
+        return self._clock() - self._last_restart <= LIVENESS_STALE_AFTER
 
     def _shape(self, state: str, finding: bool, age: float | None, *,
                detail: str) -> dict:
@@ -274,11 +320,6 @@ async def watch_button(
 
     while max_iterations is None or iterations < max_iterations:
         iterations += 1
-        # 🛑 Die Zeitmarke steht HIER, am Anfang jedes Durchlaufs, und nicht im
-        # Erfolgszweig: die Aussage ist „die Schleife dreht sich". Stünde sie
-        # nach dem Sensorabruf, läse ein ausgestöpselter Scanner — der
-        # Normalfall auf einem Arbeitsplatzrechner — als toter Wächter.
-        leben.tick()
         try:
             if device is None:
                 device = await find_device(config.device)
@@ -313,6 +354,9 @@ async def watch_button(
             if errors >= REDISCOVER_AFTER:
                 device = None
             pressed_before = False
+            # Ein VOLLENDETER Durchlauf — auch dieser hier. Begründung zur
+            # Stelle der Marke s. unten am Ende des Erfolgszweigs.
+            leben.tick()
             await sleep(ERROR_BACKOFF)
             continue
         leben.note_device(True)
@@ -343,6 +387,16 @@ async def watch_button(
                 logger.info("Knopf-Scan gestartet: %s", result["job_id"])
         pressed_before = pressed
 
+        # 🛑 Die Zeitmarke steht am ENDE des Durchlaufs, nicht an seinem
+        # Anfang. Am Anfang bedeutete sie nur „die Schleife wurde BETRETEN",
+        # und das ist in einem Absturzkreis dauernd der Fall: die Aufsicht
+        # startet neu, der Wächter betritt die Schleife, die Marke ist frisch —
+        # und das Feld meldete `alive`, während der Knopf faktisch tot war. Im
+        # Review vom 2026-10-11 nachgemessen. Am Ende bedeutet sie „ein
+        # Durchlauf ist VOLLENDET": Sensoren versucht, Flanke ausgewertet,
+        # Takt gewählt. Der Fehlerzweig oben zählt dazu — er ist ein
+        # vollständiger Durchlauf, nur ohne Gerät (`note_device`).
+        leben.tick()
         # Der teure Takt NUR mit Papier im Einzug. Ohne Papier kann der Knopf
         # ohnehin nichts auslösen, was ankommt.
         await sleep(ARMED_INTERVAL if sensors.page_loaded else IDLE_INTERVAL)

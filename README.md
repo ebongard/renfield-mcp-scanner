@@ -208,20 +208,32 @@ Schleife bei jedem Durchlauf selbst eine Marke, und nur deren Alter entscheidet
 (`LIVENESS_STALE_AFTER`, abgeleitet aus `LIVENESS_FACTOR * RESTART_BACKOFF_MAX`
 — der längsten vorgesehenen Lücke, nämlich der Wartezeit der Aufsicht).
 
-Die Marke steht am ANFANG jedes Durchlaufs, auch im Sensorfehlerpfad: die
-Aussage ist „die Schleife dreht sich", nicht „das Gerät antwortet". Ein
-schlafender oder ausgestöpselter Scanner ist der NORMALFALL auf einem
+🛑 Die Marke steht am **ENDE** jedes Durchlaufs, auch im Sensorfehlerpfad:
+sie bedeutet „ein Durchlauf ist VOLLENDET", nicht „die Schleife wurde
+betreten". Am Anfang gesetzt las ein Absturzkreis als `alive` — die Aufsicht
+startet neu, der Wächter betritt die Schleife, die Marke ist frisch, und der
+Knopf wirkt trotzdem höchstens zeitweise. Im Review vom 2026-10-11
+nachgemessen.
+
+Weil ein Kreis auch einzelne Durchläufe vollenden kann, ist die Marke allein
+nicht genug: eine FRISCHE Neustartfolge (`CRASHLOOP_RESTARTS` Neustarts, der
+letzte innerhalb der Grenze) meldet `state: "crashloop"` und ist ein Befund.
+Beide Bedingungen sind nötig — die Aufsicht setzt die Folge nur in ihrem
+Absturzzweig zurück, ein Dienst mit zwei Abstürzen beim Start trüge sie sonst
+für immer.
+
+Ein schlafender oder ausgestöpselter Scanner ist der NORMALFALL auf einem
 Arbeitsplatzrechner und darf keinen Alarm erzeugen — darum trennt der Befund
-beides (`device_readable`), und `finding` ist **nur** bei `state: "dead"`
-gesetzt. `SCANNER_BUTTON_WATCH=false` meldet `state: "off"`, kein Befund. Und
+Lebendigkeit und Gerät (`device_readable`), und `finding` ist **nur** bei
+`dead` und `crashloop` gesetzt. `SCANNER_BUTTON_WATCH=false` meldet `state: "off"`, kein Befund. Und
 der Befund reitet auf der FEHLERANTWORT mit: `scanner_status` kehrt bei
 fehlendem Gerät früh zurück, und genau dann darf die Probe den Wächter nicht
 aus den Augen verlieren.
 
 | Feld | Bedeutung |
 |---|---|
-| `state` | `off` (absichtlich aus) · `starting` (noch kein Durchlauf) · `alive` · `dead` |
-| `finding` | Nur bei `dead` wahr — darauf schaut eine Probe |
+| `state` | `off` (absichtlich aus) · `starting` (noch kein vollendeter Durchlauf) · `alive` · `dead` · `crashloop` |
+| `finding` | Wahr bei `dead` und `crashloop` — darauf schaut eine Probe |
 | `last_tick_age_seconds` / `stale_after_seconds` | Alter der Marke und die Grenze, gegen die verglichen wurde |
 | `since` | Wanduhrzeit, seit der die aktuelle Schleife läuft (nur Anzeige) |
 | `restarts_total` / `restart_streak` | Neustarts der Aufsicht insgesamt, und der Zähler aus ihrer Meldung |
