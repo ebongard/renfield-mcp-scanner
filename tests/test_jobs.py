@@ -8,6 +8,7 @@ server's event loop frozen for 12s by OCR, which is what made the refresh give u
 import asyncio
 import inspect
 import json
+import logging
 import threading
 import time
 from datetime import datetime, timedelta
@@ -949,3 +950,67 @@ class TestDieWiederholungVerstaerktSichNichtUeberNEUSTARTS:
         assert gespeichert["event"]["state"] == j.EVENT_DELIVERED
         assert len(seen) == 2
         assert "refused_since" not in gespeichert["event"]
+
+
+class TestEineFehlkonfigurationIstLAUT:
+    """🛑 Review-Befund A2 vom 2026-10-11. Vorher stand bei der 404 eine
+    `error`-Zeile mit „not retrying"; durch den Tausch aus #1391 wurde daraus
+    eine `info`-Zeile je Versuch — die Fehlkonfiguration war damit LEISER und
+    SPÄTER als vorher. Eine dauerhaft falsche Adresse ist 24 h lang eine
+    Info-Zeile unter vielen gewesen.
+    """
+
+    @staticmethod
+    def _blanke_404() -> httpx.Response:
+        return httpx.Response(404, text="404 page not found")
+
+    async def test_die_ERSTE_blanke_404_warnt_mit_der_ziel_adresse(
+            self, tmp_path, monkeypatch, caplog):
+        monkeypatch.setenv("TOK_HH", "secret")
+        store, job = await _job(tmp_path)
+        seen = []
+        notifier, _ = _notifier(tmp_path, [self._blanke_404(), 200], seen)
+
+        with caplog.at_level(logging.DEBUG):
+            await notifier.deliver(job, store)
+
+        warnungen = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert warnungen, "die erste blanke 404 MUSS warnen"
+        text = warnungen[0].getMessage()
+        assert "https://hh:8443/api/scanner/job-event" in text, (
+            f"ohne die Adresse ist die Warnung nicht handlungsfähig: {text}")
+        assert job["job_id"] in text
+
+    async def test_die_WEITEREN_404_warnen_NICHT_erneut(
+            self, tmp_path, monkeypatch, caplog):
+        """🛑 Negativkontrolle, und ohne sie wäre die Reparatur schlimmer als
+        der Befund: 24 h Wiederholung sind rund 300 Versuche, und eine Warnung,
+        die 300 Mal steht, ist keine."""
+        monkeypatch.setenv("TOK_HH", "secret")
+        store, job = await _job(tmp_path)
+        seen = []
+        notifier, _ = _notifier(
+            tmp_path, [self._blanke_404()] * 3, seen, retry_hours=0.001)
+
+        with caplog.at_level(logging.DEBUG):
+            await notifier.deliver(job, store)
+
+        assert len(seen) == 3, "drei Versuche — die Vorbedingung des Tests"
+        warnungen = [r for r in caplog.records if r.levelno == logging.WARNING
+                     and "404" in r.getMessage()]
+        assert len(warnungen) == 1, (
+            f"genau eine Warnung je Auftrag, gezählt: {len(warnungen)}")
+
+    async def test_eine_503_schreibt_KEINE_404_warnung(
+            self, tmp_path, monkeypatch, caplog):
+        """Gegenprobe zur Abgrenzung: der gewöhnliche Ausfall ist keine
+        Fehlkonfiguration und bleibt eine Info-Zeile."""
+        monkeypatch.setenv("TOK_HH", "secret")
+        store, job = await _job(tmp_path)
+        seen = []
+        notifier, _ = _notifier(tmp_path, [503, 200], seen)
+
+        with caplog.at_level(logging.DEBUG):
+            await notifier.deliver(job, store)
+
+        assert [r for r in caplog.records if r.levelno >= logging.WARNING] == []

@@ -89,7 +89,9 @@ empty feeder. And OCR ran on the event loop, freezing the server for 12 s.
   again. The separator is the duration: a blank 404 on a configured address is
   either a rollout (seconds) or a misconfiguration (forever). Any other answer
   in between (a 503, a transport error) clears the judgement — whoever answers
-  503 is reachable, so the address is right.
+  503 is reachable, so the address is right. The **first** blank 404 per job is
+  a WARNING naming the target URL and `SCANNER_CALLER_TARGET_*`; the rest are
+  INFO, because 300 identical warnings are none (review finding A2).
 - **One scan at a time.** There is one feeder, so a second request while a scan
   runs gets the running job's id back.
 - **Restarts.** Job records live under `<staging>/jobs`. A restart closes cut-off

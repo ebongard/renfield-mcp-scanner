@@ -321,12 +321,13 @@ class JobEventNotifier:
             return EVENT_FATAL, None, ""
         headers = {"Authorization": f"Bearer {token}",
                    JOB_EVENT_CONTRACT_HEADER: SCANNER_JOB_EVENT_CONTRACT_VERSION}
+        ziel = f"{target.base_url.rstrip('/')}{JOB_EVENT_PATH}"
         try:
             async with self._slot(target), self._client_factory(
                 timeout=30.0, verify=target.ca_bundle or True
             ) as client:
-                resp = await client.post(f"{target.base_url.rstrip('/')}{JOB_EVENT_PATH}",
-                                         headers=headers, json=self.payload(job))
+                resp = await client.post(ziel, headers=headers,
+                                         json=self.payload(job))
         except httpx.HTTPError as exc:
             logger.info("job %s: event transport error: %s", job["job_id"], exc)
             return EVENT_RETRY, None, ""
@@ -350,9 +351,24 @@ class JobEventNotifier:
             # Bewusste Übergangsfolge: ein Renfield-Stand ohne das Merkmal lässt
             # uns bei abgeschaltetem Ingest den ganzen Wiederholungszeitraum
             # lang anfragen. Das ist die billigere Hälfte des Irrtums.
-            logger.info("job %s: event got HTTP 404 WITHOUT %r — treated as "
-                        "retryable (an ingress 404 during a rollout looks exactly "
-                        "like this)", job["job_id"], INGEST_DISABLED_REASON)
+            #
+            # 🛑 Die ERSTE blanke 404 je Auftrag als WARNUNG, mit der Adresse.
+            # Vorher stand hier „not retrying" als `error`; eine dauerhaft
+            # falsche Adresse wäre durch den Tausch zu einer Info-Zeile unter
+            # vielen geworden — leiser UND später als vorher (Review-Befund
+            # A2). Nur die erste: 24 h Wiederholung wären sonst rund 300
+            # Warnungen, und eine Warnung, die 300 Mal steht, ist keine.
+            if (job.get("event") or {}).get("last_refusal") != REFUSAL_UNMARKED_404:
+                logger.warning(
+                    "job %s: %s answered HTTP 404 WITHOUT %r — retrying. Seconds "
+                    "of this is an ingress 404 during a rollout; hours of it is a "
+                    "wrong address (SCANNER_CALLER_TARGET_* → that target's "
+                    "base_url), and after %.1f h this event is given up for good.",
+                    job["job_id"], ziel, INGEST_DISABLED_REASON,
+                    self._config.job_event_retry_hours)
+            else:
+                logger.info("job %s: still HTTP 404 WITHOUT %r — retrying",
+                            job["job_id"], INGEST_DISABLED_REASON)
             return EVENT_RETRY, None, REFUSAL_UNMARKED_404
         logger.info("job %s: event not accepted (HTTP %s)", job["job_id"], resp.status_code)
         retry_after = (_retry_after_seconds(resp)
