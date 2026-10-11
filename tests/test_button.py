@@ -156,3 +156,164 @@ class TestSurvival:
         f.result = {"ok": False, "busy": True, "message": "läuft schon"}
         await f.run(1)
         assert len(f.jobs) == 1     # versucht, und ruhig hingenommen
+
+
+class TestDieAufsichtHaeltDenWaechterAmLeben:
+    """🛑 Der Ausfall vom 2026-10-11: eine unvorhergesehene Ausnahme beendete
+    die Wächter-Aufgabe, und weil `server.py` sie in einer starken Referenz
+    hielt, ohne sie abzuwarten, unterdrückte das Pythons eingebaute Warnung.
+
+    Gemessen: nach dem Papierstau vom 04.10. schrieb der Wächter SIEBEN TAGE
+    keine Zeile. Sein Fehlerpfad drosselt auf eine Warnung je Minute — ein
+    dauerhaft fehlendes Gerät hätte Tausende erzeugt. Es waren null.
+    """
+
+    async def test_ein_absturz_startet_die_schleife_neu(self):
+        laeufe = 0
+
+        async def crashing(_config, _start_job):
+            nonlocal laeufe
+            laeufe += 1
+            raise RuntimeError("unvorhergesehen")
+
+        schlaf: list[float] = []
+
+        async def sleep(s):
+            schlaf.append(s)
+
+        await button.supervise_button(
+            _Config(), None, watcher=crashing, sleep=sleep, max_restarts=3,
+        )
+        assert laeufe == 3, "die Schleife muss nach einem Absturz neu anlaufen"
+        assert schlaf == [button.RESTART_BACKOFF, button.RESTART_BACKOFF * 2], (
+            f"die Wartezeit muss wachsen, war {schlaf}"
+        )
+
+    async def test_die_wartezeit_ist_gedeckelt(self):
+        """Ohne Deckel würde ein langer Absturzkreis beliebig träge; mit Deckel
+        bleibt es bei einer Zeile je Minute — derselbe Takt wie im
+        Sensorfehlerpfad."""
+        async def crashing(_config, _start_job):
+            raise RuntimeError("dauerhaft")
+
+        schlaf: list[float] = []
+
+        async def sleep(s):
+            schlaf.append(s)
+
+        await button.supervise_button(
+            _Config(), None, watcher=crashing, sleep=sleep, max_restarts=40,
+        )
+        assert max(schlaf) == button.RESTART_BACKOFF_MAX
+        assert all(s <= button.RESTART_BACKOFF_MAX for s in schlaf)
+
+    async def test_ein_gesunder_waechter_wird_NICHT_neu_gestartet(self):
+        """🛑 Negativkontrolle, und die wichtigere Hälfte.
+
+        Startete die Aufsicht auch ohne Absturz neu, liefe der teure Sensortakt
+        unkontrolliert mehrfach — und der Test oben wäre trotzdem grün.
+        """
+        laeufe = 0
+
+        async def healthy(_config, _start_job):
+            nonlocal laeufe
+            laeufe += 1
+            return None          # wie `watch_button` mit max_iterations
+
+        schlaf: list[float] = []
+
+        async def sleep(s):
+            schlaf.append(s)
+
+        await button.supervise_button(
+            _Config(), None, watcher=healthy, sleep=sleep, max_restarts=5,
+        )
+        assert laeufe == 1, "ohne Absturz darf nicht neu gestartet werden"
+        assert schlaf == [], "und es darf dafür nicht gewartet werden"
+
+    async def test_abbruch_laeuft_durch(self):
+        """`asyncio.CancelledError` ist das geordnete Ende beim Herunterfahren.
+        Fängt die Aufsicht sie, hängt der Dienst beim Beenden."""
+        import asyncio as _asyncio
+
+        async def cancelled(_config, _start_job):
+            raise _asyncio.CancelledError()
+
+        with pytest.raises(_asyncio.CancelledError):
+            await button.supervise_button(
+                _Config(), None, watcher=cancelled, max_restarts=1,
+            )
+
+    async def test_nach_einem_gesunden_lauf_beginnt_die_staffelung_neu(self, monkeypatch):
+        """Die Wartezeit soll die AKTUELLE Unruhe abbilden.
+
+        Ohne Rücksetzung erbt ein Dienst, der monatelang läuft und dreimal
+        abstürzt, dauerhaft den Deckel von 60 s — und die Zählung in der Meldung
+        wirft Monate zusammen. Hier läuft der Wächter zwischen den Abstürzen
+        länger als der Deckel, also muss die Staffelung wieder bei 5 s anfangen.
+        """
+        # 🛑 Der gesunde Lauf muss MITTENDRIN liegen, nicht am Anfang. Meine
+        # erste Fassung prüfte den ERSTEN Absturz — dort steht der Zähler
+        # ohnehin auf 0, die Rücksetzung war also wirkungslos und der Test
+        # blieb auch ohne sie grün. Die Negativkontrolle hat das aufgedeckt.
+        #
+        # Folge der Laufdauern: kurz, kurz, LANG, kurz, … Die Uhr wird zweimal
+        # je Lauf abgefragt (Start und Absturz) und wiederholt die letzte Dauer.
+        uhr = _Uhr([1.0, 1.0, button.RESTART_BACKOFF_MAX + 1, 1.0])
+        monkeypatch.setattr(button.time, "monotonic", uhr)
+
+        async def crashing(_config, _start_job):
+            raise RuntimeError("weg")
+
+        schlaf: list[float] = []
+
+        async def sleep(s):
+            schlaf.append(s)
+
+        await button.supervise_button(
+            _Config(), None, watcher=crashing, sleep=sleep, max_restarts=4,
+        )
+        # kurz   -> 1. Neustart            ->  5 s
+        # kurz   -> 2. Neustart            -> 10 s
+        # LANG   -> Zähler zurück, 1.      ->  5 s   <- der Beweis
+        # kurz   -> 2.                     -> 10 s
+        # kurz   -> 3.                     -> 15 s
+        assert schlaf == [5.0, 10.0, 5.0, 10.0, 15.0], (
+            f"nach einem gesunden Lauf muss die Staffelung neu beginnen, war {schlaf}"
+        )
+
+    async def test_ein_absturzkreis_erbt_die_staffelung_WEITER(self, monkeypatch):
+        """🛑 Negativkontrolle zur Rücksetzung: stürzt der Wächter SOFORT wieder
+        ab, darf der Zähler NICHT zurückgesetzt werden — sonst hämmert ein
+        Absturzkreis dauerhaft im 5-Sekunden-Takt und flutet das Protokoll.
+        """
+        monkeypatch.setattr(button.time, "monotonic", lambda: 0.0)
+
+        async def crashing(_config, _start_job):
+            raise RuntimeError("dauerhaft")
+
+        schlaf: list[float] = []
+
+        async def sleep(s):
+            schlaf.append(s)
+
+        await button.supervise_button(
+            _Config(), None, watcher=crashing, sleep=sleep, max_restarts=4,
+        )
+        assert schlaf == [5.0, 10.0, 15.0], f"Staffelung muss wachsen, war {schlaf}"
+
+
+class _Uhr:
+    """Monotone Uhr mit vorgegebenen Laufdauern, je Lauf zwei Abfragen."""
+
+    def __init__(self, laufdauern: list[float]):
+        self.laufdauern = list(laufdauern)
+        self.aufrufe = 0
+
+    def __call__(self) -> float:
+        lauf = self.aufrufe // 2
+        start_abfrage = self.aufrufe % 2 == 0
+        self.aufrufe += 1
+        if start_abfrage:
+            return 0.0
+        return self.laufdauern[min(lauf, len(self.laufdauern) - 1)]

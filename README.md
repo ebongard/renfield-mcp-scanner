@@ -124,6 +124,23 @@ ein Trennblatt sticht ihn aus. Die FERTIGMELDUNG braucht dagegen eine feste
 Adresse — ohne `SCANNER_CALLER_TARGET_BUTTON` läuft der Scan durch, aber niemand
 erfährt davon. Abschaltbar mit `SCANNER_BUTTON_WATCH=false`.
 
+🛑 **Der Wächter läuft unter Aufsicht, und sein Ende ist hörbar.** Bis zum
+2026-10-11 lief er als nackte Task: `watch_button` fängt alles Vorgesehene ab
+(fehlendes Gerät, Sensorfehler, abgelehnter Scan-Start), aber eine
+UNVORHERGESEHENE Ausnahme beendete die Aufgabe endgültig — lautlos, weil die
+starke Referenz in `server.py` Pythons Warnung „Task exception was never
+retrieved" unterdrückte: die feuert erst beim Aufräumen, und aufgeräumt wurde
+nie. Gemessen am Haushalt: nach dem Papierstau vom 2026-10-04 15:24 schrieb der
+Wächter **sieben Tage** keine Zeile, obwohl sein Fehlerpfad gedrosselt eine
+Warnung je Minute protokolliert — ein fehlendes Gerät hätte Tausende erzeugt.
+Der blaue Knopf war eine Woche tot, und nichts hat es gesagt.
+
+Jetzt startet `supervise_button` die Schleife nach einem Absturz neu (Wartezeit
+5 s, wachsend, gedeckelt auf 60 s — im Dauerfehler eine Zeile je Minute, derselbe
+Takt wie im Sensorfehlerpfad), und ein Abschluss-Rückruf protokolliert jedes Ende
+der Aufgabe. `asyncio.CancelledError` läuft durch: sie ist das geordnete
+Herunterfahren.
+
 ## Tools
 
 | Tool | Purpose |
