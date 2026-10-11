@@ -244,7 +244,7 @@ class TestDieAufsichtHaeltDenWaechterAmLeben:
                 _Config(), None, watcher=cancelled, max_restarts=1,
             )
 
-    async def test_nach_einem_gesunden_lauf_beginnt_die_staffelung_neu(self, monkeypatch):
+    async def test_nach_einem_gesunden_lauf_beginnt_die_staffelung_neu(self):
         """Die Wartezeit soll die AKTUELLE Unruhe abbilden.
 
         Ohne Rücksetzung erbt ein Dienst, der monatelang läuft und dreimal
@@ -260,7 +260,6 @@ class TestDieAufsichtHaeltDenWaechterAmLeben:
         # Folge der Laufdauern: kurz, kurz, LANG, kurz, … Die Uhr wird zweimal
         # je Lauf abgefragt (Start und Absturz) und wiederholt die letzte Dauer.
         uhr = _Uhr([1.0, 1.0, button.RESTART_BACKOFF_MAX + 1, 1.0])
-        monkeypatch.setattr(button.time, "monotonic", uhr)
 
         async def crashing(_config, _start_job):
             raise RuntimeError("weg")
@@ -271,24 +270,24 @@ class TestDieAufsichtHaeltDenWaechterAmLeben:
             schlaf.append(s)
 
         await button.supervise_button(
-            _Config(), None, watcher=crashing, sleep=sleep, max_restarts=4,
+            _Config(), None, watcher=crashing, sleep=sleep, clock=uhr,
+            max_restarts=4,
         )
-        # kurz   -> 1. Neustart            ->  5 s
-        # kurz   -> 2. Neustart            -> 10 s
-        # LANG   -> Zähler zurück, 1.      ->  5 s   <- der Beweis
-        # kurz   -> 2.                     -> 10 s
-        # kurz   -> 3.                     -> 15 s
-        assert schlaf == [5.0, 10.0, 5.0, 10.0, 15.0], (
+        B = button.RESTART_BACKOFF
+        # kurz   -> 1. Neustart        -> 1*B
+        # kurz   -> 2. Neustart        -> 2*B
+        # LANG   -> Zähler zurück, 1.  -> 1*B   <- der Beweis
+        # kurz   -> 2.                 -> 2*B
+        # kurz   -> 3.                 -> 3*B
+        assert schlaf == [B, 2 * B, B, 2 * B, 3 * B], (
             f"nach einem gesunden Lauf muss die Staffelung neu beginnen, war {schlaf}"
         )
 
-    async def test_ein_absturzkreis_erbt_die_staffelung_WEITER(self, monkeypatch):
+    async def test_ein_absturzkreis_erbt_die_staffelung_WEITER(self):
         """🛑 Negativkontrolle zur Rücksetzung: stürzt der Wächter SOFORT wieder
         ab, darf der Zähler NICHT zurückgesetzt werden — sonst hämmert ein
         Absturzkreis dauerhaft im 5-Sekunden-Takt und flutet das Protokoll.
         """
-        monkeypatch.setattr(button.time, "monotonic", lambda: 0.0)
-
         async def crashing(_config, _start_job):
             raise RuntimeError("dauerhaft")
 
@@ -298,9 +297,11 @@ class TestDieAufsichtHaeltDenWaechterAmLeben:
             schlaf.append(s)
 
         await button.supervise_button(
-            _Config(), None, watcher=crashing, sleep=sleep, max_restarts=4,
+            _Config(), None, watcher=crashing, sleep=sleep, clock=lambda: 0.0,
+            max_restarts=4,
         )
-        assert schlaf == [5.0, 10.0, 15.0], f"Staffelung muss wachsen, war {schlaf}"
+        B = button.RESTART_BACKOFF
+        assert schlaf == [B, 2 * B, 3 * B], f"Staffelung muss wachsen, war {schlaf}"
 
 
 class _Uhr:
@@ -317,3 +318,47 @@ class _Uhr:
         if start_abfrage:
             return 0.0
         return self.laufdauern[min(lauf, len(self.laufdauern) - 1)]
+
+
+class TestDieAufsichtUmgehtDieSelbstbremseNICHT:
+    """🛑 Der Befund aus dem Review vom 2026-10-11, und er wog schwerer als der
+    Fehler, gegen den die Aufsicht gebaut ist.
+
+    Ein neu gestarteter `watch_button` beginnt mit `device = None` und ruft
+    deshalb sofort `find_device`. Produktiv ist `config.device` LEER
+    (`SCANNER_DEVICE` setzt niemand), also läuft dort `scanimage -f` — die
+    vollständige SANE-Suche, die den USB-Anschluss belegt. Gemessen am
+    2026-10-11 am laufenden Dienst: 4,3 s zwischen „Knopfwächter aktiv" und
+    „Gerät …".
+
+    `watch_button` bremst sich dafür selbst: neu gesucht wird erst nach
+    `REDISCOVER_AFTER` Fehlschlägen, also höchstens alle
+    `REDISCOVER_AFTER * ERROR_BACKOFF` Sekunden — eine Grenze aus der Messung,
+    die den Scanner am 2026-09-25 FESTGESETZT hat. Eine Aufsicht, die
+    schneller neu startet, umgeht genau diese Bremse: aus „Knopf tot" würde
+    „Gerät fest, dafür lautes Protokoll".
+    """
+
+    async def test_die_wartezeit_unterbietet_die_suchbremse_nie(self):
+        async def crashing(_config, _start_job):
+            raise RuntimeError("dauerhaft")
+
+        schlaf: list[float] = []
+
+        async def sleep(s):
+            schlaf.append(s)
+
+        await button.supervise_button(
+            _Config(), None, watcher=crashing, sleep=sleep, clock=lambda: 0.0,
+            max_restarts=6,
+        )
+        bremse = button.REDISCOVER_AFTER * button.ERROR_BACKOFF
+        assert min(schlaf) >= bremse, (
+            f"kein Neustart darf schneller kommen als die Suchbremse von "
+            f"{bremse} s — gemessen wurde {min(schlaf)} s"
+        )
+
+    async def test_die_konstante_ist_an_die_bremse_GEBUNDEN_nicht_geraten(self):
+        """Eine gleich grosse Zahl wäre Zufall und driftet beim nächsten Umbau
+        auseinander. Die Wartezeit muss AUS der Bremse abgeleitet sein."""
+        assert button.RESTART_BACKOFF == button.REDISCOVER_AFTER * button.ERROR_BACKOFF

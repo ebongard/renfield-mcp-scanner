@@ -67,7 +67,21 @@ IDLE_INTERVAL = 1.0    # ohne Papier: ~1 % eines Kerns
 ARMED_INTERVAL = 0.2   # mit Papier: fängt den ~200-ms-Impuls, s. Modulkopf
 ERROR_BACKOFF = 5.0    # Gerät weg/schläft: nicht im Leerlauf hämmern
 REDISCOVER_AFTER = 3   # so viele Fehlschläge in Folge, bevor neu gesucht wird
-RESTART_BACKOFF = 5.0  # nach einem Absturz der Schleife, s. `supervise_button`
+#: Wartezeit nach einem Absturz der Schleife. 🛑 ABGELEITET, nicht gewählt:
+#: ein neu gestarteter `watch_button` beginnt mit `device = None` und ruft
+#: deshalb sofort `find_device`. `config.device` ist produktiv LEER
+#: (`SCANNER_DEVICE` setzt niemand), also läuft dort `scanimage -f` — der
+#: langsame Pfad, der alle SANE-Backends durchkämmt und dabei den USB-Anschluss
+#: belegt. Gemessen am 2026-10-11: 4,3 s je Suche.
+#:
+#: `watch_button` bremst sich dafür selbst: im Sensorfehlerpfad sucht es erst
+#: nach `REDISCOVER_AFTER` Fehlschlägen neu, also höchstens alle
+#: `REDISCOVER_AFTER * ERROR_BACKOFF` Sekunden. Diese Grenze stammt aus der
+#: Messung vom 2026-09-25, die den Scanner FESTGESETZT hat (s. Modulkopf).
+#: Eine Aufsicht, die schneller neu startet, umgeht genau diese Bremse — aus
+#: „Knopf tot" würde „Gerät fest". Darum bindet die Wartezeit an dieselbe
+#: Grenze und wird nie kleiner.
+RESTART_BACKOFF = REDISCOVER_AFTER * ERROR_BACKOFF
 RESTART_BACKOFF_MAX = 60.0  # Deckel: im Dauerfehler eine Zeile je Minute
 
 
@@ -166,6 +180,7 @@ async def supervise_button(
     *,
     watcher: Callable[..., Awaitable[None]] | None = None,
     sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+    clock: Callable[[], float] = time.monotonic,
     max_restarts: int | None = None,
 ) -> None:
     """Hält den Knopfwächter am Leben — und macht sein Ende HÖRBAR.
@@ -199,14 +214,18 @@ async def supervise_button(
     `Exception`, fällt also ohnehin nicht in den Fang unten — das steht hier,
     damit es beim nächsten Umbau nicht versehentlich verlorengeht.
 
-    `watcher` und `max_restarts` gibt es allein für Tests: ohne
+    `watcher`, `clock` und `max_restarts` gibt es allein für Tests: ohne
     Abbruchbedingung wäre eine Aufsicht über eine Endlosschleife nicht prüfbar.
+    Die Uhr ist EINGEHÄNGT und wird nicht global verbogen — ein Patch auf
+    `time.monotonic` gilt prozessweit, und die Ereignisschleife fragt sie
+    selbst ab; ein aufrufzahl-gekoppelter Doppelgänger wäre dann phasenver-
+    schoben, ohne dass es auffällt.
     """
     run = watcher if watcher is not None else watch_button
     restarts = 0
 
     while True:
-        begonnen = time.monotonic()
+        begonnen = clock()
         try:
             await run(config, start_job)
         except Exception:
@@ -217,7 +236,7 @@ async def supervise_button(
             # monatelang läuft und dreimal abstürzt, dauerhaft die 60 Sekunden,
             # und die Zählung in der Meldung („12. Neustart") führt in die Irre,
             # weil sie Monate zusammenwirft.
-            if time.monotonic() - begonnen > RESTART_BACKOFF_MAX:
+            if clock() - begonnen > RESTART_BACKOFF_MAX:
                 restarts = 0
             restarts += 1
             # `exception` statt `error`: ohne Rückverfolgung wäre die Ursache

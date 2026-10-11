@@ -135,11 +135,21 @@ Wächter **sieben Tage** keine Zeile, obwohl sein Fehlerpfad gedrosselt eine
 Warnung je Minute protokolliert — ein fehlendes Gerät hätte Tausende erzeugt.
 Der blaue Knopf war eine Woche tot, und nichts hat es gesagt.
 
-Jetzt startet `supervise_button` die Schleife nach einem Absturz neu (Wartezeit
-5 s, wachsend, gedeckelt auf 60 s — im Dauerfehler eine Zeile je Minute, derselbe
-Takt wie im Sensorfehlerpfad), und ein Abschluss-Rückruf protokolliert jedes Ende
-der Aufgabe. `asyncio.CancelledError` läuft durch: sie ist das geordnete
-Herunterfahren.
+Jetzt startet `supervise_button` die Schleife nach einem Absturz neu und ein
+Abschluss-Rückruf protokolliert jedes Ende der Aufgabe. `asyncio.CancelledError`
+läuft durch: sie ist das geordnete Herunterfahren.
+
+🛑 **Die Wartezeit ist ABGELEITET, nicht gewählt**:
+`RESTART_BACKOFF = REDISCOVER_AFTER * ERROR_BACKOFF` (15 s), wachsend, gedeckelt
+auf 60 s. Grund: ein neu gestarteter Wächter beginnt mit `device = None` und
+ruft sofort `find_device`. Produktiv ist `config.device` LEER — `SCANNER_DEVICE`
+setzt niemand —, also läuft dort `scanimage -f`, die vollständige SANE-Suche,
+die den USB-Anschluss belegt (am 2026-10-11 gemessen: 4,3 s je Suche). Eine
+Aufsicht, die schneller neu startet als die Bremse, die sich `watch_button`
+selbst setzt, würde genau den Takt erzeugen, der den Scanner am 2026-09-25
+festgesetzt hat. Aus „Knopf tot" würde „Gerät fest" — eine Reparatur, die
+schlimmer ist als der Fehler. Zwei Tests halten die Grenze UND ihre Ableitung
+fest; eine gleich große Zahl wäre Zufall und driftet beim nächsten Umbau.
 
 ## Tools
 
