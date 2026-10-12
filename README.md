@@ -63,6 +63,39 @@ empty feeder. And OCR ran on the event loop, freezing the server for 12 s.
   never a poll. The caller is known from its Bearer token.
   `SCANNER_CALLER_TARGET_<CALLER>` names that caller's target, and the target's
   base URL and push token carry the event.
+- 🛑 **A 404 is final only when it carries the application's marker.** The
+  application answers `{"detail": {"reason": "folder_ingest_disabled", …}}` when
+  folder ingest is off, and only THAT 404 stops the retries
+  (`contract.INGEST_DISABLED_REASON`). Every other 404 — a bare body, a `detail`
+  that is a string, a foreign reason — is retryable, because the same number
+  comes from the ingress while no pod is ready. Measured on 2026-10-11 during a
+  rollout: two 503 were retried correctly, then a Traefik 404 discarded the
+  completion event for good. That it never reached the application is proven —
+  `FOLDER_INGEST_ENABLED` was `true` and the backend log has no `job-event` line
+  for that second. 401/403 stay final: both arise in the application and are
+  unambiguous. 🛑 The marker is NOT `reason: "feature_disabled"` — that one is
+  generic (two other Renfield routes use it for two different features) and it
+  rides on a **503**, i.e. on a retryable answer. A reason that foreign routes
+  use for "not now" must never mean "forever"; a test pins that the scanner
+  refuses it as a marker (review finding B2). Transitional consequence, accepted deliberately: against a
+  Renfield build that does not send the marker yet, a switched-off ingest is
+  retried for the whole retry horizon — see the next bullet for what bounds it.
+- 🛑 **A blank 404 is retried for `SCANNER_JOB_EVENT_RETRY_HOURS` IN TOTAL, not
+  per service start.** Retrying is the safe side of the 404 split, but it
+  amplifies: `gave_up` events are re-sent on every start with a fresh attempt
+  budget and only expire with `SCANNER_STAGING_RETENTION_DAYS`, so a wrong
+  `base_url` in `SCANNER_CALLER_TARGET_<CALLER>` — which answers a blank 404,
+  indistinguishable from a rollout's — would be asked ~300 times per start for
+  up to 30 days, where it used to cost one ERROR line and stop (review finding
+  A1). The bound: the time of the FIRST blank 404 is written into the record
+  (`refused_since`, wall clock, so it survives a restart), and once the span is
+  exceeded the event settles as `gave_up_404` — a state that is never re-sent
+  again. The separator is the duration: a blank 404 on a configured address is
+  either a rollout (seconds) or a misconfiguration (forever). Any other answer
+  in between (a 503, a transport error) clears the judgement — whoever answers
+  503 is reachable, so the address is right. The **first** blank 404 per job is
+  a WARNING naming the target URL and `SCANNER_CALLER_TARGET_*`; the rest are
+  INFO, because 300 identical warnings are none (review finding A2).
 - **One scan at a time.** There is one feeder, so a second request while a scan
   runs gets the running job's id back.
 - **Restarts.** Job records live under `<staging>/jobs`. A restart closes cut-off
@@ -84,6 +117,37 @@ empty feeder. And OCR ran on the event loop, freezing the server for 12 s.
   holds a slot, not the backoff sleep. The backoff is jittered so open events do
   not retry in lockstep, and a `Retry-After` on 429/503 is honoured up to the
   5-minute backoff cap. The 24 h retry horizon is unchanged.
+
+## Ein wartender Stapel fordert eine ENTSCHEIDUNG an
+
+🛑 Gemessen am 2026-10-11: ein Stapel mit `reason: scanner_fault`
+(`Document feeder jammed`, zwei Seiten, 20 MB) lag **sieben Tage** im
+Zwischenlager. Zwei digitalisierte Seiten eines Briefes, die nie in einer
+Instanz ankamen — und gemeldet wurde er allein als Zahl in der Startzeile
+(„2 target(s), 1 pending, 0 purged"). Eine Zahl in einer INFO-Zeile liest sich
+wie ein Betriebszustand, nicht wie eine offene Entscheidung.
+
+`list_pending_scans` hat solche Stapel nie verschwiegen — `reason`, `detail`
+und `at` standen immer im Eintrag (nachgemessen, bevor etwas geändert wurde).
+Gefehlt haben das abgeleitete **Alter** (`age_seconds`) und die Unterscheidung
+vom vorgesehenen Wartezustand: `fault` ist wahr für alles, was nicht
+`unrouted` ist. Ein `unrouted`-Stapel wartet auf einen Menschen; ein
+Fehler-Stapel wartet darauf, dass jemand überhaupt von ihm erfährt. Beide
+abgeleiteten Felder stehen NACH den Metadaten aus der Datei, damit eine fremde
+`stage.json` das Urteil nicht umschreiben kann.
+
+Beim Start wird je Stapel, der länger als `SCANNER_PENDING_WARN_DAYS` (Vorgabe:
+ein Tag, `0` schaltet ab) liegt, eine **Warnung** mit Alter, Grund und
+Seitenzahl geschrieben. Je Start genau einmal — kein Takt, kein Wecker, sondern
+die Gelegenheit, bei der der Zustand ohnehin gelesen wird.
+
+**Die Aufbewahrung greift auch für Fehler-Stapel**, und zwar ohne Unterschied
+nach Grund: `SCANNER_STAGING_RETENTION_DAYS` ab der letzten Änderung des
+Verzeichnisses, also ab dem letzten `keep`. Ein Test hält das fest. 🛑 Gekehrt
+wird beim START des Dienstes — ein Dienst, der monatelang durchläuft, kehrt
+nicht aus. Auf dem Bedienrechner ist das in der Praxis kein Zeitraum (er
+schläft, startet neu, wird aktualisiert), aber es ist eine Annahme und keine
+Zusage.
 
 ## Separator sheets
 
@@ -151,12 +215,65 @@ festgesetzt hat. Aus „Knopf tot" würde „Gerät fest" — eine Reparatur, di
 schlimmer ist als der Fehler. Zwei Tests halten die Grenze UND ihre Ableitung
 fest; eine gleich große Zahl wäre Zufall und driftet beim nächsten Umbau.
 
+🛑 **`scanner_status` sagt, ob der Wächter LEBT — und die Antwort hängt an
+einer Zeitmarke, nicht an einer Task.** Nach dem Ausfall oben ist der Tod des
+Wächters laut (eine ERROR-Zeile mit Rückverfolgung), aber er meldet sich nicht:
+eine Protokollzeile wartet, bis jemand nachsieht, und am 2026-10-04 hat sieben
+Tage niemand nachgesehen. Das Feld `button_watcher` macht ihn auffindbar — für
+eine funktionale MCP-Probe, die das Werkzeug ohnehin aufrufen kann.
+
+Die Falle, die dabei zählt: die Task EXISTIERTE in diesen sieben Tagen. Jede
+Auskunft, die daraus abgeleitet wäre, hätte „läuft" gemeldet. Also setzt die
+Schleife bei jedem Durchlauf selbst eine Marke, und nur deren Alter entscheidet.
+
+Die Grenze ist ABGELEITET, Summand für Summand:
+`LIVENESS_WORST_GAP = RESTART_BACKOFF_MAX + 2 × sane.PROBE_TIMEOUT +
+ERROR_BACKOFF` — die Wartezeit der Aufsicht nach einem Absturz, plus eine
+hängende Gerätesuche, plus ein hängender Sensorabruf, plus die Wartezeit am
+Ende des Durchlaufs. Darauf `LIVENESS_FACTOR` (zwei), damit ein einzelner
+unvorhergesehener Halt noch keinen Fehlalarm ergibt. Die beiden SANE-Grenzen
+sind der Grund und standen in der ersten Fassung nicht in der Rechnung
+(Review-Befund L2): ein hängendes `scanimage` zieht die Lücke über die
+Wartezeit der Aufsicht hinaus, ohne dass der Wächter steht. Die Zeitgrenze
+steht darum nur EINMAL als Zahl, in `sane.PROBE_TIMEOUT`.
+
+🛑 Die Marke steht am **ENDE** jedes Durchlaufs, auch im Sensorfehlerpfad:
+sie bedeutet „ein Durchlauf ist VOLLENDET", nicht „die Schleife wurde
+betreten". Am Anfang gesetzt las ein Absturzkreis als `alive` — die Aufsicht
+startet neu, der Wächter betritt die Schleife, die Marke ist frisch, und der
+Knopf wirkt trotzdem höchstens zeitweise. Im Review vom 2026-10-11
+nachgemessen.
+
+Weil ein Kreis auch einzelne Durchläufe vollenden kann, ist die Marke allein
+nicht genug: eine FRISCHE Neustartfolge (`CRASHLOOP_RESTARTS` Neustarts, der
+letzte innerhalb der Grenze) meldet `state: "crashloop"` und ist ein Befund.
+Beide Bedingungen sind nötig — die Aufsicht setzt die Folge nur in ihrem
+Absturzzweig zurück, ein Dienst mit zwei Abstürzen beim Start trüge sie sonst
+für immer.
+
+Ein schlafender oder ausgestöpselter Scanner ist der NORMALFALL auf einem
+Arbeitsplatzrechner und darf keinen Alarm erzeugen — darum trennt der Befund
+Lebendigkeit und Gerät (`device_readable`), und `finding` ist **nur** bei
+`dead` und `crashloop` gesetzt. `SCANNER_BUTTON_WATCH=false` meldet `state: "off"`, kein Befund. Und
+der Befund reitet auf der FEHLERANTWORT mit: `scanner_status` kehrt bei
+fehlendem Gerät früh zurück, und genau dann darf die Probe den Wächter nicht
+aus den Augen verlieren.
+
+| Feld | Bedeutung |
+|---|---|
+| `state` | `off` (absichtlich aus) · `starting` (noch kein vollendeter Durchlauf) · `alive` · `dead` · `crashloop` |
+| `finding` | Wahr bei `dead` und `crashloop` — darauf schaut eine Probe |
+| `last_tick_age_seconds` / `stale_after_seconds` | Alter der Marke und die Grenze, gegen die verglichen wurde |
+| `since` | Wanduhrzeit, seit der die aktuelle Schleife läuft (nur Anzeige) |
+| `restarts_total` / `restart_streak` | Neustarts der Aufsicht insgesamt, und der Zähler aus ihrer Meldung |
+| `device_readable` | Ob der letzte Sensorabruf gelang — `false` ist KEIN Befund |
+
 ## Tools
 
 | Tool | Purpose |
 |---|---|
 | `list_scanners` | The attached scanner, its settings, configured targets |
-| `scanner_status` | Real hardware state from the SANE sensors — never inferred |
+| `scanner_status` | Real hardware state from the SANE sensors — never inferred — plus whether the button watcher is alive |
 | `scan_document` | START a scan job (feed, correct, route, push in the background); returns a `job_id` at once, `busy` while another scan runs |
 | `scan_job_status` | How a job stands or ended — for an explicit question, not for polling |
 | `list_pending_scans` | Scans held here awaiting a decision or a retry |

@@ -6,14 +6,18 @@ refresh tear the call down and an automatic retry scan an empty feeder; and the
 server's event loop frozen for 12s by OCR, which is what made the refresh give up.
 """
 import asyncio
+import inspect
 import json
+import logging
 import threading
 import time
+from datetime import datetime, timedelta
 from types import SimpleNamespace
 
 import httpx
 import pytest
 
+from renfield_mcp_scanner import contract
 from renfield_mcp_scanner import jobs as j
 from renfield_mcp_scanner.config import Config, ScanTarget
 
@@ -248,6 +252,10 @@ def _notifier(tmp_path, replies, seen, **cfg):
         reply = replies.pop(0)
         if isinstance(reply, Exception):
             raise reply
+        # Eine fertige Antwort darf durchgegeben werden: der RUMPF entscheidet,
+        # ob eine 404 endgültig ist, und der lässt sich nicht als Zahl ausdrücken.
+        if isinstance(reply, httpx.Response):
+            return reply
         return httpx.Response(reply)
 
     transport = httpx.MockTransport(handler)
@@ -293,8 +301,10 @@ async def test_event_retries_with_backoff_then_delivers(tmp_path, monkeypatch):
     assert sleeps == [2.0, 4.0]
 
 
-@pytest.mark.parametrize("code", [401, 403, 404])
+@pytest.mark.parametrize("code", [401, 403])
 async def test_event_stops_on_answers_a_retry_cannot_fix(tmp_path, monkeypatch, code):
+    """401/403 bleiben endgültig: beide entstehen anwendungsseitig und
+    eindeutig. 🛑 404 steht hier NICHT mehr — siehe die eigene Klasse unten."""
     monkeypatch.setenv("TOK_HH", "secret")
     store, job = await _job(tmp_path)
     seen = []
@@ -304,6 +314,122 @@ async def test_event_stops_on_answers_a_retry_cannot_fix(tmp_path, monkeypatch, 
 
     assert (await store.load(job["job_id"]))["event"]["state"] == j.EVENT_FATAL
     assert len(seen) == 1 and sleeps == []
+
+
+# --- die 404 trägt ihre Endgültigkeit im RUMPF (#1391) ---------------------------
+
+class TestEine404IstNurMitMerkmalEndgueltig:
+    """🛑 Der Ausfall vom 2026-10-11, beim Token-Wechsel selbst verursacht.
+
+    Während eines Backend-Rollouts bekam Auftrag `1a88c2d6…` zwei 503 (richtig
+    wiederholt) und dann eine 404 von Traefik — und die verwarf die
+    Fertigmeldung ENDGÜLTIG. Dass die Anwendung sie nie gesehen hat, ist belegt:
+    `FOLDER_INGEST_ENABLED` stand auf `true`, und im Backend-Protokoll steht zur
+    Sekunde der Ablehnung keine `job-event`-Zeile, nur Startmeldungen.
+    Rückblickend erklärt dasselbe zwei verworfene echte Scans vom 2026-10-04.
+
+    Die Zahl allein trägt die Unterscheidung nicht. Das Merkmal im Rumpf tut es.
+    """
+
+    @staticmethod
+    def _abgeschaltet() -> httpx.Response:
+        """Die Antwort der ANWENDUNG bei abgeschaltetem Ordner-Ingest."""
+        return httpx.Response(404, json={"detail": {
+            "reason": contract.INGEST_DISABLED_REASON,
+            "message": "Folder ingest is disabled",
+        }})
+
+    async def test_eine_404_MIT_dem_merkmal_bleibt_endgueltig(self, tmp_path, monkeypatch):
+        """Ein dauerhaft abgeschalteter Ingest darf nicht stundenlang angefragt
+        werden — das war an der alten Behandlung richtig und bleibt es."""
+        monkeypatch.setenv("TOK_HH", "secret")
+        store, job = await _job(tmp_path)
+        seen = []
+        notifier, sleeps = _notifier(tmp_path, [self._abgeschaltet()], seen)
+
+        await notifier.deliver(job, store)
+
+        assert (await store.load(job["job_id"]))["event"]["state"] == j.EVENT_FATAL
+        assert len(seen) == 1 and sleeps == []
+
+    @pytest.mark.parametrize("antwort, was", [
+        (httpx.Response(404, text="404 page not found"), "Traefik, reiner Text"),
+        (httpx.Response(404, json={"detail": "Not Found"}), "detail als Text"),
+        (httpx.Response(404, json={"detail": {"reason": "etwas_anderes"}}), "fremder Grund"),
+        (httpx.Response(404, json={"detail": {}}), "leeres detail"),
+        (httpx.Response(404, json=["nope"]), "Rumpf ist kein Objekt"),
+        (httpx.Response(404), "gar kein Rumpf"),
+    ])
+    async def test_eine_404_OHNE_das_merkmal_wird_wiederholt(
+            self, tmp_path, monkeypatch, antwort, was):
+        """🛑 Die Gegenprobe zur Endgültigkeit, in jeder Form, in der eine
+        fremde 404 wirklich eintrifft. `was` benennt die Form in der Ausgabe."""
+        monkeypatch.setenv("TOK_HH", "secret")
+        store, job = await _job(tmp_path)
+        seen = []
+        notifier, sleeps = _notifier(tmp_path, [antwort, 200], seen)
+
+        await notifier.deliver(job, store)
+
+        assert (await store.load(job["job_id"]))["event"] == {
+            "state": j.EVENT_DELIVERED, "attempts": 2}, (
+            f"eine 404 ohne Merkmal ({was}) muss wiederholt werden")
+        assert sleeps == [2.0]
+
+    async def test_der_gemessene_verlauf_vom_2026_10_11_geht_jetzt_durch(
+            self, tmp_path, monkeypatch):
+        """Der Ablauf aus dem Protokoll, Zeile für Zeile: 503, 503, 404 — und
+        danach ist der Pod bereit. Vorher endete das bei der 404 als `fatal`."""
+        monkeypatch.setenv("TOK_HH", "secret")
+        store, job = await _job(tmp_path)
+        seen = []
+        notifier, sleeps = _notifier(
+            tmp_path, [503, 503, httpx.Response(404, text="404 page not found"), 200], seen)
+
+        await notifier.deliver(job, store)
+
+        assert (await store.load(job["job_id"]))["event"] == {
+            "state": j.EVENT_DELIVERED, "attempts": 4}
+        assert len(sleeps) == 3
+
+    async def test_der_GENERISCHE_grund_zaehlt_NICHT_als_merkmal(
+            self, tmp_path, monkeypatch):
+        """🛑 Review-Befund B2, und die Entscheidung dazu.
+
+        Auf der Renfield-Seite heisst dieselbe Tatsache an zwei anderen Routen
+        ``reason: "feature_disabled"`` (`folder_ingest.py`, `email_ingest.py`)
+        — dort generisch für zwei verschiedene Funktionen und an einer **503**,
+        also an einer WIEDERHOLBAREN Antwort. Unser Merkmal reist an einer 404
+        und trägt die ENDGÜLTIGKEIT.
+
+        Die beiden gleichzuziehen würde genau die Verwechslung bauen, gegen die
+        #1391 geschrieben ist: ein Grund, den fremde Routen für „nicht jetzt"
+        benutzen, darf nie „für immer" bedeuten. Hängt ihn eine dritte Route
+        einmal an eine 404, verschwindet dort still eine Fertigmeldung.
+        """
+        monkeypatch.setenv("TOK_HH", "secret")
+        store, job = await _job(tmp_path)
+        seen = []
+        notifier, _ = _notifier(tmp_path, [
+            httpx.Response(404, json={"detail": {"reason": "feature_disabled",
+                                                 "message": "Folder ingest is disabled"}}),
+            200,
+        ], seen)
+
+        await notifier.deliver(job, store)
+
+        assert (await store.load(job["job_id"]))["event"]["state"] == j.EVENT_DELIVERED, (
+            "der generische Grund darf keine Fertigmeldung verwerfen")
+        assert contract.INGEST_DISABLED_REASON != "feature_disabled"
+
+    def test_das_merkmal_ist_der_VERTRAG_nicht_ein_wort_in_jobs_py(self):
+        """Beide Seiten prüfen gegen dieselbe Zeichenkette. Stünde sie als
+        Literal in `jobs.py`, wäre genau das die Stelle, an der sie bei der
+        nächsten Umbenennung auseinanderläuft."""
+        assert contract.INGEST_DISABLED_REASON == "folder_ingest_disabled"
+        quelle = inspect.getsource(j.JobEventNotifier.send_once)
+        assert "INGEST_DISABLED_REASON" in quelle or "_ingest_is_switched_off" in quelle
+        assert "folder_ingest_disabled" not in quelle
 
 
 async def test_event_gives_up_only_after_the_retry_horizon(tmp_path, monkeypatch):
@@ -721,3 +847,201 @@ def test_unauthenticated_loopback_is_the_default_caller():
     no_state = SimpleNamespace(request_context=SimpleNamespace(
         request=SimpleNamespace(state=SimpleNamespace())))
     assert _caller(no_state) == "default"
+
+
+class TestDieWiederholungVerstaerktSichNichtUeberNEUSTARTS:
+    """🛑 Review-Befund A1 vom 2026-10-11.
+
+    Seit die blanke 404 wiederholbar ist, war der Zeitraum nicht auf
+    `job_event_retry_hours` begrenzt, sondern auf diese Spanne JE DIENSTSTART:
+    `EVENT_GAVE_UP` steht in `_EVENT_RESEND_ON_RESTART`, und `recover` gibt ein
+    frisches Budget (`attempts = 0`). Ein aufgegebenes Ereignis verfällt erst
+    nach `SCANNER_STAGING_RETENTION_DAYS`.
+
+    Fehlerfall: eine falsche `base_url` in `SCANNER_CALLER_TARGET_<CALLER>`
+    antwortet blanke 404, von einer Rollout-404 nicht unterscheidbar. VORHER
+    eine Fehlerzeile und Schluss; danach rund 300 Versuche über 24 h — und das
+    nach jedem Dienststart erneut, bis zu 30 Tage.
+
+    Die Trennung ist die DAUER: eine blanke 404 auf eine konfigurierte Adresse
+    ist entweder ein Rollout (Sekunden) oder ein Konfigurationsfehler (für
+    immer).
+    """
+
+    @staticmethod
+    def _blanke_404() -> httpx.Response:
+        return httpx.Response(404, text="404 page not found")
+
+    async def test_eine_dauerhafte_blanke_404_wird_ENDGUELTIG_aufgegeben(
+            self, tmp_path, monkeypatch):
+        """Der Zeitpunkt der ersten blanken 404 steht im Datensatz, also gilt
+        die Spanne über Neustarts hinweg. Hier liegt er 25 h zurück."""
+        monkeypatch.setenv("TOK_HH", "secret")
+        store, job = await _job(tmp_path)
+        job["event"]["last_refusal"] = j.REFUSAL_UNMARKED_404
+        job["event"]["refused_since"] = (
+            datetime.now() - timedelta(hours=25)).isoformat(timespec="seconds")
+        await store.save(job)
+        seen = []
+        notifier, sleeps = _notifier(tmp_path, [self._blanke_404()], seen)
+
+        await notifier.deliver(job, store)
+
+        gespeichert = await store.load(job["job_id"])
+        assert gespeichert["event"]["state"] == j.EVENT_GAVE_UP_404
+        assert len(seen) == 1 and sleeps == [], (
+            "nach dem Urteil darf kein weiterer Versuch folgen")
+        # 🛑 Und der Zeitpunkt der ERSTEN Abweisung darf sich dabei nicht
+        # erneuern. Täte er es (`=` statt `setdefault`), schöbe jede weitere
+        # 404 die Frist vor sich her, die Spanne liefe nie ab — und dieser
+        # Test wäre dann nicht nur in dieser Zeile rot, sondern in der oberen:
+        # das Urteil käme überhaupt nicht.
+        assert gespeichert["event"]["refused_since"].startswith(
+            job["event"]["refused_since"][:16])
+
+    async def test_ein_so_aufgegebenes_ereignis_wird_beim_neustart_NICHT_wiederholt(
+            self, tmp_path, monkeypatch):
+        """Die Hälfte, die die Verstärkung tatsächlich begrenzt."""
+        monkeypatch.setenv("TOK_HH", "secret")
+        store = j.JobStore(tmp_path)
+        await store.save({"job_id": "4" * 32, "status": j.DONE, "caller": "household",
+                          "result": {"ok": True},
+                          "event": {"state": j.EVENT_GAVE_UP_404, "attempts": 300,
+                                    "last_refusal": j.REFUSAL_UNMARKED_404}})
+        seen = []
+        notifier, _ = _notifier(tmp_path, [], seen)
+        manager = j.JobManager(store, run_scan=None, notifier=notifier)
+
+        bericht = await manager.recover()
+        await manager.wait_idle()
+
+        assert bericht["resent"] == 0
+        assert seen == [], "kein frisches Budget für eine falsche Adresse"
+        assert (await store.load("4" * 32))["event"]["state"] == j.EVENT_GAVE_UP_404
+
+    async def test_ein_gewoehnlicher_ausfall_wird_beim_neustart_WEITER_wiederholt(
+            self, tmp_path, monkeypatch):
+        """🛑 Negativkontrolle, und sie ist die wichtigere: ein Backend, das 24 h
+        lang 503 antwortet, ist ein ECHTER Ausfall. Dessen Fertigmeldung muss
+        der Neustart weiter aufnehmen — genau dafür steht `EVENT_GAVE_UP` in
+        der Neustart-Menge."""
+        monkeypatch.setenv("TOK_HH", "secret")
+        store = j.JobStore(tmp_path)
+        await store.save({"job_id": "5" * 32, "status": j.DONE, "caller": "household",
+                          "result": {"ok": True},
+                          "event": {"state": j.EVENT_GAVE_UP, "attempts": 300}})
+        seen = []
+        notifier, _ = _notifier(tmp_path, [200], seen)
+        manager = j.JobManager(store, run_scan=None, notifier=notifier)
+
+        bericht = await manager.recover()
+        await manager.wait_idle()
+
+        assert bericht["resent"] == 1 and len(seen) == 1
+        assert (await store.load("5" * 32))["event"]["state"] == j.EVENT_DELIVERED
+
+    async def test_eine_FRISCHE_blanke_404_wird_normal_wiederholt(
+            self, tmp_path, monkeypatch):
+        """🛑 Negativkontrolle zum Urteil. Die Rollout-404 ist Sekunden alt —
+        sie muss den gewöhnlichen Weg gehen, sonst ist der Fix aus #1391
+        wieder weg."""
+        monkeypatch.setenv("TOK_HH", "secret")
+        store, job = await _job(tmp_path)
+        seen = []
+        notifier, sleeps = _notifier(
+            tmp_path, [self._blanke_404(), self._blanke_404(), 200], seen)
+
+        await notifier.deliver(job, store)
+
+        gespeichert = await store.load(job["job_id"])
+        assert gespeichert["event"]["state"] == j.EVENT_DELIVERED
+        assert len(seen) == 3 and sleeps == [2.0, 4.0]
+        assert "last_refusal" not in gespeichert["event"], (
+            "eine zugestellte Meldung trägt keine Abweisung mehr")
+
+    async def test_eine_503_nach_einer_404_loescht_das_urteil(
+            self, tmp_path, monkeypatch):
+        """🛑 Die zweite Negativkontrolle zum Urteil, und die feinere: wer nach
+        der blanken 404 mit 503 antwortet, IST erreichbar — die Adresse stimmt
+        also. Bliebe die Abweisung stehen, würde ein echter Ausfall nach einem
+        Rollout als Adressfehler verurteilt."""
+        monkeypatch.setenv("TOK_HH", "secret")
+        store, job = await _job(tmp_path)
+        job["event"]["last_refusal"] = j.REFUSAL_UNMARKED_404
+        job["event"]["refused_since"] = (
+            datetime.now() - timedelta(hours=25)).isoformat(timespec="seconds")
+        await store.save(job)
+        seen = []
+        notifier, sleeps = _notifier(tmp_path, [503, 200], seen, retry_hours=24.0)
+
+        await notifier.deliver(job, store)
+
+        gespeichert = await store.load(job["job_id"])
+        assert gespeichert["event"]["state"] == j.EVENT_DELIVERED
+        assert len(seen) == 2 and sleeps == [2.0], (
+            "die 503 muss den gewöhnlichen Weg gehen, nicht das Urteil erben")
+        assert "refused_since" not in gespeichert["event"]
+
+
+class TestEineFehlkonfigurationIstLAUT:
+    """🛑 Review-Befund A2 vom 2026-10-11. Vorher stand bei der 404 eine
+    `error`-Zeile mit „not retrying"; durch den Tausch aus #1391 wurde daraus
+    eine `info`-Zeile je Versuch — die Fehlkonfiguration war damit LEISER und
+    SPÄTER als vorher. Eine dauerhaft falsche Adresse ist 24 h lang eine
+    Info-Zeile unter vielen gewesen.
+    """
+
+    @staticmethod
+    def _blanke_404() -> httpx.Response:
+        return httpx.Response(404, text="404 page not found")
+
+    async def test_die_ERSTE_blanke_404_warnt_mit_der_ziel_adresse(
+            self, tmp_path, monkeypatch, caplog):
+        monkeypatch.setenv("TOK_HH", "secret")
+        store, job = await _job(tmp_path)
+        seen = []
+        notifier, _ = _notifier(tmp_path, [self._blanke_404(), 200], seen)
+
+        with caplog.at_level(logging.DEBUG):
+            await notifier.deliver(job, store)
+
+        warnungen = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert warnungen, "die erste blanke 404 MUSS warnen"
+        text = warnungen[0].getMessage()
+        assert "https://hh:8443/api/scanner/job-event" in text, (
+            f"ohne die Adresse ist die Warnung nicht handlungsfähig: {text}")
+        assert job["job_id"] in text
+
+    async def test_die_WEITEREN_404_warnen_NICHT_erneut(
+            self, tmp_path, monkeypatch, caplog):
+        """🛑 Negativkontrolle, und ohne sie wäre die Reparatur schlimmer als
+        der Befund: 24 h Wiederholung sind rund 300 Versuche, und eine Warnung,
+        die 300 Mal steht, ist keine."""
+        monkeypatch.setenv("TOK_HH", "secret")
+        store, job = await _job(tmp_path)
+        seen = []
+        notifier, _ = _notifier(
+            tmp_path, [self._blanke_404()] * 3, seen, retry_hours=0.001)
+
+        with caplog.at_level(logging.DEBUG):
+            await notifier.deliver(job, store)
+
+        assert len(seen) == 3, "drei Versuche — die Vorbedingung des Tests"
+        warnungen = [r for r in caplog.records if r.levelno == logging.WARNING
+                     and "404" in r.getMessage()]
+        assert len(warnungen) == 1, (
+            f"genau eine Warnung je Auftrag, gezählt: {len(warnungen)}")
+
+    async def test_eine_503_schreibt_KEINE_404_warnung(
+            self, tmp_path, monkeypatch, caplog):
+        """Gegenprobe zur Abgrenzung: der gewöhnliche Ausfall ist keine
+        Fehlkonfiguration und bleibt eine Info-Zeile."""
+        monkeypatch.setenv("TOK_HH", "secret")
+        store, job = await _job(tmp_path)
+        seen = []
+        notifier, _ = _notifier(tmp_path, [503, 200], seen)
+
+        with caplog.at_level(logging.DEBUG):
+            await notifier.deliver(job, store)
+
+        assert [r for r in caplog.records if r.levelno >= logging.WARNING] == []

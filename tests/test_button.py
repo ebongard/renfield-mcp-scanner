@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import pytest
 
-from renfield_mcp_scanner import button
+from renfield_mcp_scanner import button, sane
 from renfield_mcp_scanner.sane import Sensors
 
 
@@ -403,3 +403,328 @@ class TestDieAufsichtUmgehtDieSelbstbremseNICHT:
         """Eine gleich grosse Zahl wäre Zufall und driftet beim nächsten Umbau
         auseinander. Die Wartezeit muss AUS der Bremse abgeleitet sein."""
         assert button.RESTART_BACKOFF == button.REDISCOVER_AFTER * button.ERROR_BACKOFF
+
+
+class _Uhr2:
+    """Steuerbare monotone Uhr: `jetzt` wird im Test von Hand gestellt."""
+
+    def __init__(self, jetzt: float = 0.0):
+        self.jetzt = jetzt
+
+    def __call__(self) -> float:
+        return self.jetzt
+
+
+class _MitzaehlendeLebendigkeit(button.WatcherLiveness):
+    """Zählt die Zeitmarken mit — „bei JEDEM Durchlauf" ist sonst nicht prüfbar."""
+
+    def __init__(self, **kw):
+        super().__init__(**kw)
+        self.marken = 0
+
+    def tick(self) -> None:
+        self.marken += 1
+        super().tick()
+
+
+class TestDerWaechterbefundHaengtAnEinerZEITMARKE:
+    """🛑 Die Falle aus #3, und sie ist der ganze Grund für dieses Feld.
+
+    Die Task des Wächters EXISTIERTE sieben Tage lang, während der blaue Knopf
+    ohne Wirkung war — `server.py` hielt sie in einer starken Referenz, und die
+    Schleife darin war tot. Eine Auskunft, die aus dem Vorhandensein der Task
+    oder aus `task.done()` abgeleitet wäre, hätte in diesen sieben Tagen „läuft"
+    gemeldet. Geprüft wird darum ausschliesslich das ALTER einer Marke, die die
+    Schleife selbst setzt.
+    """
+
+    async def test_eine_vorhandene_aber_TOTE_schleife_liest_als_tot(self):
+        """Der gemessene Fall: ein Durchlauf, dann nie wieder. Keine Task wird
+        dafür befragt — die Marke veraltet, und das genügt."""
+        uhr = _Uhr2()
+        leben = button.WatcherLiveness(clock=uhr)
+        leben.loop_started()
+        leben.tick()
+        leben.note_device(True)
+
+        uhr.jetzt = button.LIVENESS_STALE_AFTER + 1
+        befund = leben.report(enabled=True)
+
+        assert befund["state"] == button.WATCHER_DEAD
+        assert befund["finding"] is True, "ein stehender Wächter IST ein Befund"
+        assert befund["last_tick_age_seconds"] == button.LIVENESS_STALE_AFTER + 1
+
+    async def test_ein_lebender_waechter_liest_als_lebend(self):
+        """🛑 Gegenprobe: knapp INNERHALB der Grenze darf kein Befund stehen,
+        sonst meldet die Probe bei jedem langsamen Durchlauf einen Ausfall."""
+        uhr = _Uhr2()
+        leben = button.WatcherLiveness(clock=uhr)
+        leben.loop_started()
+        leben.tick()
+        leben.note_device(True)
+
+        uhr.jetzt = button.LIVENESS_STALE_AFTER - 1
+        befund = leben.report(enabled=True)
+
+        assert befund["state"] == button.WATCHER_ALIVE
+        assert befund["finding"] is False
+        assert befund["since"], "das Feld fuer „seit wann“ muss gesetzt sein"
+
+    async def test_ein_nicht_erreichbares_geraet_ist_KEIN_befund(self):
+        """🛑 DIE wichtigste Gegenprobe. Ein ausgestöpselter oder schlafender
+        Scanner ist der NORMALFALL auf einem Arbeitsplatzrechner. Hing die
+        Marke am erfolgreichen Sensorabruf, läse genau dieser Normalfall als
+        toter Wächter — und die Probe würde alarmieren, sobald der Rechner
+        schläft.
+        """
+        leben = _MitzaehlendeLebendigkeit()
+        f = _Fake([_sensors(paper=False)])
+        f.raise_on = {0, 1, 2, 3, 4}          # das Gerät antwortet NIE
+        await button.watch_button(
+            _Config(), f.start_job, read_sensors=f.read_sensors,
+            find_device=f.find_device, sleep=f.sleep, liveness=leben,
+            max_iterations=5,
+        )
+        befund = leben.report(enabled=True)
+
+        assert leben.marken == 5, (
+            f"die Marke muss in JEDEM Durchlauf gesetzt werden, auch im "
+            f"Sensorfehlerpfad — gezählt: {leben.marken}")
+        assert befund["state"] == button.WATCHER_ALIVE
+        assert befund["finding"] is False, (
+            "ein nicht erreichbares Gerät darf keinen Alarm auslösen")
+        assert befund["device_readable"] is False, (
+            "unterscheidbar bleiben muss es trotzdem")
+        assert befund["state"] != button.WATCHER_CRASHLOOP, (
+            "und es ist erst recht kein Absturzkreis — die Schleife vollendet "
+            "jeden Durchlauf, sie findet nur kein Gerät")
+
+    async def test_ein_lesbares_geraet_wird_als_lesbar_gemeldet(self):
+        """Gegenprobe zur Gegenprobe: ohne sie wäre `device_readable` auch
+        dann `False`, wenn alles in Ordnung ist, und der Unterschied wertlos."""
+        leben = _MitzaehlendeLebendigkeit()
+        f = _Fake([_sensors(paper=False)] * 3)
+        await button.watch_button(
+            _Config(), f.start_job, read_sensors=f.read_sensors,
+            find_device=f.find_device, sleep=f.sleep, liveness=leben,
+            max_iterations=3,
+        )
+        befund = leben.report(enabled=True)
+        assert leben.marken == 3
+        assert befund["device_readable"] is True
+        assert befund["state"] == button.WATCHER_ALIVE
+
+    async def test_abgeschaltet_meldet_absichtlich_AUS_und_nicht_tot(self):
+        """`SCANNER_BUTTON_WATCH=false` ist eine Entscheidung, kein Ausfall —
+        etwa auf einem Host ohne angeschlossenes Gerät."""
+        uhr = _Uhr2()
+        leben = button.WatcherLiveness(clock=uhr)
+        uhr.jetzt = 10 * button.LIVENESS_STALE_AFTER   # nie getickt, lange her
+
+        befund = leben.report(enabled=False)
+
+        assert befund["state"] == button.WATCHER_OFF
+        assert befund["state"] != button.WATCHER_DEAD
+        assert befund["finding"] is False
+        assert "SCANNER_BUTTON_WATCH" in befund["detail"]
+
+    async def test_nie_getickt_liest_erst_startend_und_dann_tot(self):
+        """Zwei Fälle in einem: die erste Gerätesuche dauert messbar (4,3 s am
+        2026-10-11), also ist „noch keine Marke" kurz nach dem Start normal.
+        🛑 Bleibt sie dauerhaft aus — eine Verdrahtung, die den Wächter gar
+        nicht erst startet —, muss daraus ein Befund werden statt für immer
+        „startet gerade".
+        """
+        uhr = _Uhr2()
+        leben = button.WatcherLiveness(clock=uhr)
+
+        uhr.jetzt = 5.0
+        assert leben.report(enabled=True)["state"] == button.WATCHER_STARTING
+        assert leben.report(enabled=True)["finding"] is False
+
+        uhr.jetzt = button.LIVENESS_STALE_AFTER + 1
+        spaet = leben.report(enabled=True)
+        assert spaet["state"] == button.WATCHER_DEAD
+        assert spaet["finding"] is True
+
+    async def test_die_neustarts_der_aufsicht_stehen_im_befund(self):
+        """Die Aufsicht ist die einzige Stelle, die sie kennt. Die Lebenssumme
+        steht neben dem Zähler aus der Meldung, weil der nach einem gesunden
+        Lauf neu beginnt und die Summe sonst untertreibt."""
+        leben = button.WatcherLiveness()
+
+        async def crashing(_config, _start_job):
+            raise RuntimeError("dauerhaft")
+
+        async def sleep(_s):
+            pass
+
+        await button.supervise_button(
+            _Config(), None, watcher=crashing, sleep=sleep, clock=lambda: 0.0,
+            liveness=leben, max_restarts=3,
+        )
+        befund = leben.report(enabled=True)
+        assert befund["restarts_total"] == 3
+        assert befund["restart_streak"] == 3
+
+    def test_die_grenze_ist_aus_der_laengsten_LUECKE_abgeleitet(self):
+        """🛑 Eine geratene Zahl driftet beim nächsten Umbau.
+
+        Review-Befund L2 vom 2026-10-11: die erste Fassung leitete allein aus
+        der Wartezeit der Aufsicht ab und liess die beiden SANE-Zeitgrenzen
+        aus. Ein hängendes `scanimage` zieht die Lücke aber über diese
+        Wartezeit hinaus, OHNE dass der Wächter steht — und genau dann hätte
+        das Feld einen Ausfall erfunden.
+        """
+        assert (button.LIVENESS_STALE_AFTER
+                == button.LIVENESS_FACTOR * button.LIVENESS_WORST_GAP)
+        assert button.LIVENESS_WORST_GAP == (
+            button.RESTART_BACKOFF_MAX + 2 * sane.PROBE_TIMEOUT
+            + button.ERROR_BACKOFF), "die Summanden müssen die Lücke ERGEBEN"
+        for takt in (button.IDLE_INTERVAL, button.ARMED_INTERVAL,
+                     button.ERROR_BACKOFF, button.RESTART_BACKOFF,
+                     button.RESTART_BACKOFF_MAX):
+            assert button.LIVENESS_STALE_AFTER > takt, (
+                f"die Grenze muss den Takt {takt} s vertragen, sonst ist jeder "
+                f"normale Zustand ein Fehlalarm")
+
+    def test_eine_haengende_SANE_abfrage_erfindet_keinen_ausfall(self):
+        """Der schlimmste vorgesehene Fall in einer Zahl: ein Neustart der
+        Aufsicht, danach eine hängende Gerätesuche UND ein hängender
+        Sensorabruf, beide bis an ihre Zeitgrenze. Dabei ist nichts kaputt —
+        also darf die Grenze darüber liegen."""
+        schlimmste_luecke = (button.RESTART_BACKOFF_MAX + 2 * sane.PROBE_TIMEOUT
+                             + button.ERROR_BACKOFF)
+        assert button.LIVENESS_STALE_AFTER > schlimmste_luecke, (
+            f"{button.LIVENESS_STALE_AFTER} s Grenze gegen {schlimmste_luecke} s "
+            f"Lücke — eine hängende Abfrage würde als toter Wächter gelesen")
+
+    def test_die_SANE_grenze_steht_nur_EINMAL_als_zahl(self):
+        """Die Ableitung ist nur so gut wie ihre Quelle: lesen die Abfragen
+        ihre Zeitgrenze nicht aus derselben Konstante, läuft die Rechnung beim
+        nächsten Umbau still auseinander."""
+        import inspect
+
+        for funktion in (sane.find_device, sane.read_sensors):
+            quelle = inspect.getsource(funktion)
+            assert "timeout=PROBE_TIMEOUT" in quelle, (
+                f"{funktion.__name__} muss die benannte Konstante benutzen")
+
+    def test_die_marke_kommt_aus_der_SCHLEIFE_nicht_aus_einer_task(self):
+        """Strukturprüfung auf die Invariante aus #3: setzt die Schleife die
+        Marke nicht selbst, ist jede Auskunft wieder eine Vermutung über eine
+        Task — und die war sieben Tage lang falsch."""
+        import inspect
+
+        schleife = inspect.getsource(button.watch_button)
+        assert ".tick()" in schleife
+        bericht = inspect.getsource(button.WatcherLiveness.report)
+        for wort in ("task", "done()", "cancelled"):
+            assert wort not in bericht, (
+                f"der Befund darf nichts über eine Task wissen ({wort!r})")
+
+    def test_beide_greifen_vorgabeweise_auf_DASSELBE_exemplar(self):
+        """Ein Prozess, ein Wächter. Griffen Schleife und Aufsicht auf
+        verschiedene Exemplare, stünden im Befund zwei halbe Auskünfte."""
+        import inspect
+
+        for funktion in (button.watch_button, button.supervise_button):
+            quelle = inspect.getsource(funktion)
+            assert "else LIVENESS" in quelle, (
+                f"{funktion.__name__} muss auf das Modul-Exemplar zurückfallen")
+
+
+class TestEinAbsturzkreisIstKeinLEBEN:
+    """🛑 Der Befund der gegnerischen Durchsicht (2026-10-11), und er traf
+    genau den Fall, für den das Lebenszeichen existiert: ein dauerhaft
+    abstürzender Wächter las als `alive`.
+
+    Ursache: die Marke stand am ANFANG des Durchlaufs und bedeutete damit nur
+    „die Schleife wurde betreten". Ein Absturzkreis betritt sie ständig — die
+    Aufsicht startet neu, der Wächter betritt, die Marke ist frisch. Der blaue
+    Knopf wirkte dabei höchstens zeitweise.
+
+    Zwei Änderungen, und beide werden hier einzeln überführt: die Marke
+    bedeutet jetzt „Durchlauf VOLLENDET", und eine frische Neustartfolge ist
+    selbst ein Befund.
+    """
+
+    async def test_ein_abgebrochener_durchlauf_setzt_KEINE_marke(self):
+        """Der Abbruch an der einzigen unbewachten Stelle, die #3 benannt hat:
+        `start_job` liefert etwas, das kein Wörterbuch ist, und `result.get`
+        wirft NACH dem Scan-Start. Mit der Marke am Anfang war sie trotzdem
+        frisch — der Durchlauf war es nicht."""
+        leben = _MitzaehlendeLebendigkeit()
+        f = _Fake([_sensors(pressed=True, paper=True)])
+
+        async def start_job(**_kw):
+            return None          # kein Wörterbuch -> AttributeError bei .get
+
+        with pytest.raises(AttributeError):
+            await button.watch_button(
+                _Config(), start_job, read_sensors=f.read_sensors,
+                find_device=f.find_device, sleep=f.sleep, liveness=leben,
+                max_iterations=1,
+            )
+
+        assert leben.marken == 0, (
+            "ein Durchlauf, der mitten drin abbricht, ist nicht vollendet")
+        assert leben.report(enabled=True)["state"] != button.WATCHER_ALIVE
+
+    async def test_ein_absturzkreis_MIT_frischen_marken_ist_ein_befund(self):
+        """Der härtere Fall: der Kreis vollendet einzelne Durchläufe, die Marke
+        ist also frisch. Trotzdem wirkt der Knopf höchstens zeitweise — die
+        Marke allein kann das nicht ausdrücken."""
+        leben = button.WatcherLiveness()
+
+        async def crashing(_config, _start_job):
+            leben.tick()                 # ein vollendeter Durchlauf …
+            raise RuntimeError("weg")    # … und dann der Absturz
+
+        async def sleep(_s):
+            pass
+
+        await button.supervise_button(
+            _Config(), None, watcher=crashing, sleep=sleep, clock=lambda: 0.0,
+            liveness=leben, max_restarts=3,
+        )
+        befund = leben.report(enabled=True)
+
+        assert befund["last_tick_age_seconds"] is not None, (
+            "die Vorbedingung des Tests: die Marke IST frisch")
+        assert befund["state"] == button.WATCHER_CRASHLOOP
+        assert befund["finding"] is True, (
+            "ein dauerhaft abstürzender Wächter ist ein Befund, kein Leben")
+        assert befund["restart_streak"] >= button.CRASHLOOP_RESTARTS
+
+    async def test_EIN_neustart_nach_einem_gesunden_lauf_ist_KEIN_befund(self):
+        """🛑 Negativkontrolle. Die Aufsicht setzt die Folge nach einem
+        gesunden Lauf zurück; ein einzelner Absturz nach Monaten Betrieb steht
+        als Rückverfolgung im Protokoll, und die Schleife läuft. Würde das
+        alarmieren, wäre die Alarmierung binnen Wochen Rauschen."""
+        leben = button.WatcherLiveness()
+        leben.note_restart(1)
+        leben.tick()
+        leben.note_device(True)
+
+        befund = leben.report(enabled=True)
+        assert befund["state"] == button.WATCHER_ALIVE
+        assert befund["finding"] is False
+
+    async def test_eine_ALTE_neustartfolge_ist_kein_befund(self):
+        """🛑 Negativkontrolle zur Frische. Die Folge wird von der Aufsicht nur
+        im Absturzzweig zurückgesetzt — ein Dienst, der zweimal beim Start
+        abstürzte und danach monatelang läuft, trägt die Zwei für immer. Ohne
+        den Zeitpunkt des letzten Neustarts läse er für immer als Absturzkreis.
+        """
+        uhr = _Uhr2()
+        leben = button.WatcherLiveness(clock=uhr)
+        leben.note_restart(3)                 # die Unruhe von damals
+        uhr.jetzt = button.LIVENESS_STALE_AFTER + 1
+        leben.tick()                          # … und seither läuft er
+        leben.note_device(True)
+
+        befund = leben.report(enabled=True)
+        assert befund["state"] == button.WATCHER_ALIVE
+        assert befund["finding"] is False
+        assert befund["restarts_total"] == 1, "die Historie bleibt sichtbar"

@@ -69,7 +69,12 @@ async def list_scanners() -> dict:
 @mcp.tool()
 async def scanner_status() -> dict:
     """Report the scanner's real hardware state: ready, paper loaded, cover
-    open, power save, double feed, error code."""
+    open, power save, double feed, error code — plus whether the hardware
+    button's watcher is alive.
+
+    A scanner that is asleep or unplugged is a NORMAL state: this server runs on
+    an operator workstation. `button_watcher.finding` is true only when the
+    watcher itself is not running, which means the blue button does nothing."""
     config, _ = _ctx()
     return await t.scanner_status(config)
 
@@ -113,7 +118,13 @@ async def scan_job_status(ctx: Context, job_id: str) -> dict:
 @mcp.tool()
 async def list_pending_scans() -> dict:
     """List scans held on the scanner host: awaiting a routing decision, or
-    retained because a push or the scanner itself failed."""
+    retained because a push or the scanner itself failed.
+
+    Each entry carries `reason`, `age_seconds` and `fault`. `fault: true` means
+    these pages are the remains of a scan that FAILED — nobody is waiting for a
+    decision on them, and nobody has been told they exist. Say so, with the age
+    and the reason, rather than counting them in with the rest. They are deleted
+    after `SCANNER_STAGING_RETENTION_DAYS`."""
     _, staging = _ctx()
     return {"ok": True, "pending": staging.pending()}
 
@@ -232,6 +243,12 @@ async def _serve() -> None:
     logger.info("scanner MCP on %s:%s — %d target(s), %d pending, %d purged",
                 _config.mcp_host, _config.mcp_port, len(_config.targets),
                 len(_staging.pending()), purged)
+    # 🛑 Die Zahl in der Zeile darüber war die GANZE Meldung, und das war der
+    # Fehler: ein Stapel mit `reason: scanner_fault` lag sieben Tage im
+    # Zwischenlager (zwei digitalisierte Seiten eines Briefes), und „1 pending"
+    # liest sich wie ein Betriebszustand, nicht wie eine offene Entscheidung.
+    # Darum je zu alten Stapel eine Warnung mit Alter und Grund.
+    _staging.warn_stale(_config.staging_warn_after_days)
     # Started here, NOT via FastMCP lifespan: lifespan is the per-MCP-session
     # hook, not ASGI startup, so anything registered there would only run while
     # an agent happens to be connected.

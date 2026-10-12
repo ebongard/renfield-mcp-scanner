@@ -25,6 +25,45 @@ SCANNER_JOB_EVENT_CONTRACT_VERSION = "1"
 JOB_EVENT_CONTRACT_HEADER = "X-Scanner-Job-Contract"
 JOB_EVENT_PATH = "/api/scanner/job-event"
 
+#: Das Merkmal, an dem eine 404 DER ANWENDUNG erkennbar ist. Renfield antwortet
+#: bei abgeschaltetem Ordner-Ingest mit
+#: ``{"detail": {"reason": "folder_ingest_disabled", "message": "…"}}``.
+#:
+#: 🛑 Eine 404 OHNE dieses Merkmal ist WIEDERHOLBAR, nicht endgültig. Am
+#: 2026-10-11 während eines Backend-Rollouts gemessen: auf zwei richtig
+#: wiederholte 503 folgte eine 404 von Traefik, und die verwarf die
+#: Fertigmeldung endgültig. Dass sie nicht von der Anwendung kam, ist belegt —
+#: `FOLDER_INGEST_ENABLED` stand auf `true`, und im Backend-Protokoll steht zu
+#: dieser Sekunde keine `job-event`-Zeile, nur Startmeldungen. Die Zahl allein
+#: trägt die Unterscheidung also nicht; das Merkmal tut es.
+#:
+#: 🛑 NICHT ZU VERWECHSELN mit ``reason: "feature_disabled"``. Dieselbe Tatsache
+#: hat auf der Renfield-Seite einen zweiten Namen (`api/routes/folder_ingest.py`
+#: und `api/routes/email_ingest.py`), und das bleibt mit Absicht so:
+#:
+#: * ``feature_disabled`` ist GENERISCH — zwei verschiedene Routen für zwei
+#:   verschiedene Funktionen antworten damit — und es reist mit **503**. Es ist
+#:   eine Erläuterung an einer WIEDERHOLBAREN Antwort, kein Endgültigkeitszeichen.
+#: * Dieses Merkmal hier reist mit **404** und trägt die ENDGÜLTIGKEIT: es ist
+#:   die einzige Zeichenkette im System, auf die ein Absender eine Fertigmeldung
+#:   verwirft.
+#:
+#: Die beiden gleichzuziehen würde genau die Verwechslung bauen, gegen die
+#: #1391 geschrieben ist: ein generischer Grund, den heute zwei fremde Routen
+#: für „nicht jetzt" benutzen, dürfte nie „für immer" bedeuten. Käme eine
+#: dritte Route auf die Idee, ihn an eine 404 zu hängen, verschwände dort still
+#: eine Fertigmeldung. Ein Test hält darum fest, dass ``feature_disabled`` als
+#: Merkmal NICHT zählt.
+#:
+#: Dieses Merkmal ist von der Versionsregel oben AUSGENOMMEN, und zwar bewusst:
+#: es steht nur im FEHLERRUMPF und ist in beide Richtungen verträglich. Ein
+#: Renfield ohne das Merkmal lässt den Absender wiederholen (siehe
+#: `JobEventNotifier.send_once`), ein Scanner ohne diese Prüfung verwirft wie
+#: bisher. Ein Versionssprung würde dagegen auf JEDER Meldung eine
+#: Abweichungswarnung auf beiden Seiten erzeugen, solange nur eine Seite
+#: ausgerollt ist — Lärm ohne Erkenntnis.
+INGEST_DISABLED_REASON = "folder_ingest_disabled"
+
 
 class IngestStatus(str, Enum):
     """The backend's 4-state reply. All four arrive as HTTP 200."""

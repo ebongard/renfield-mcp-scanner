@@ -7,7 +7,7 @@ import asyncio
 import logging
 from pathlib import Path
 
-from . import audit, classifier, sane, separator
+from . import audit, button, classifier, sane, separator
 from .config import Config, MissingTokenError
 from .contract import StageAction
 from .pusher import TargetPusher
@@ -40,18 +40,33 @@ async def list_scanners(config: Config) -> dict:
     }
 
 
-async def scanner_status(config: Config) -> dict:
-    """Real hardware state from the SANE sensor group — never inferred."""
+async def scanner_status(
+    config: Config, *, liveness: button.WatcherLiveness | None = None,
+) -> dict:
+    """Real hardware state from the SANE sensor group — never inferred.
+
+    Plus `button_watcher`: is the button watcher alive? That half is not
+    hardware, and it is the reason this tool is worth probing. After #3 the
+    watcher's death is LOUD (an ERROR line with a traceback) but it still only
+    waits for someone to read the log — and on 2026-10-04 nobody read it for
+    seven days. A functional probe calling this tool finds it by itself.
+
+    🛑 The watcher verdict rides on the ERROR reply too. A sleeping or
+    unplugged scanner is the NORMAL state on an operator workstation, so the
+    early return below is the common case — and losing sight of the watcher
+    exactly then would make the probe blind whenever it matters most.
+    """
+    verdict = (liveness or button.LIVENESS).report(enabled=config.button_watch)
     try:
         device = await sane.find_device(config.device)
         s = await sane.read_sensors(device)
     except sane.ScannerError as exc:
-        return _err(str(exc))
+        return {**_err(str(exc)), "button_watcher": verdict}
     return {
         "ok": True, "device": device, "ready": s.ready,
         "paper_loaded": s.page_loaded, "cover_open": s.cover_open,
         "power_save": s.power_save, "double_feed": s.double_feed,
-        "error_code": s.error_code,
+        "error_code": s.error_code, "button_watcher": verdict,
     }
 
 
