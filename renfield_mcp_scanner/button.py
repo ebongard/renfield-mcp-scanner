@@ -55,7 +55,7 @@ from datetime import datetime
 from typing import Any, Awaitable, Callable
 
 
-from . import sane
+from . import sane, usb
 
 logger = logging.getLogger("renfield-mcp-scanner.button")
 
@@ -297,12 +297,28 @@ class WatcherLiveness:
 LIVENESS = WatcherLiveness()
 
 
+async def _knoten(scanner_node: Callable[[], Awaitable[usb.UsbNode | None]]) -> str:
+    """Auskunft über den USB-Knoten, nie werfend.
+
+    Eine Diagnosezeile darf den Wächter nicht mitnehmen — sonst wäre die
+    Beobachtung selbst die nächste Ausfallursache.
+    """
+    try:
+        node = await scanner_node()
+    except Exception as exc:  # noqa: BLE001 — Diagnose, nie tragend
+        return f"USB-Knoten: keine Auskunft ({exc})"
+    return str(node) if node is not None else "USB-Knoten: keine Auskunft"
+
+
 async def watch_button(
     config: Any,
     start_job: Callable[..., Awaitable[dict]],
     *,
     read_sensors: Callable[[str], Awaitable[sane.Sensors]] = sane.read_sensors,
     find_device: Callable[[str], Awaitable[str]] = sane.find_device,
+    # Freie Diagnose am USB-Knoten: liest die Registratur des Kernels, fasst
+    # das Gerät nicht an. Einspritzbar, damit Tests kein `ioreg` aufrufen.
+    scanner_node: Callable[[], Awaitable[usb.UsbNode | None]] = usb.scanner_node,
     sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
     liveness: WatcherLiveness | None = None,
     max_iterations: int | None = None,
@@ -329,6 +345,13 @@ async def watch_button(
     scanning = False
     iterations = 0
     errors = 0
+    # 🛑 ZWEITER Zähler, bewusst nicht `errors`. `errors` ist monoton und trägt
+    # die Protokolldrosselung (eine Meldung je Minute) und die Erholungsmeldung
+    # („wieder lesbar nach N Fehlversuch(en)"); würde man ihn für den Riegel
+    # zurücksetzen, käme die Warnung alle 21 s und die Zahl in der
+    # Erholungsmeldung wäre falsch. Dieser hier zählt NUR bis zur nächsten
+    # Suche und wird dabei zurückgesetzt.
+    since_rediscover = 0
     leben = liveness if liveness is not None else LIVENESS
     leben.loop_started()
 
@@ -337,7 +360,8 @@ async def watch_button(
         try:
             if device is None:
                 device = await find_device(config.device)
-                logger.info("Knopfwächter: Gerät %s", device)
+                logger.info("Knopfwächter: Gerät %s (%s)", device,
+                            await _knoten(scanner_node))
             sensors = await read_sensors(device)
         except Exception as exc:
             # Ein ausgestöpselter oder schlafender Scanner ist ein normaler
@@ -354,8 +378,14 @@ async def watch_button(
             errors += 1
             leben.note_device(False, str(exc))
             if errors == 1 or errors % int(60 / ERROR_BACKOFF) == 0:
+                # 🛑 Der Knoten hängt an der GEDROSSELTEN Zeile, nicht am Takt:
+                # ein `ioreg` je Minute, nicht eines je fünf Sekunden. Er
+                # trennt in der Auswertung „Scanner aus" von „verklemmt" —
+                # beides ergab bis 2026-10-12 dasselbe Bild, und genau deshalb
+                # sind am 2026-10-11 15,3 h Ausfall unbemerkt verstrichen.
                 logger.warning("Knopfwächter: Sensor nicht lesbar (%s) — "
-                               "%d. Versuch seit dem letzten Erfolg", exc, errors)
+                               "%d. Versuch seit dem letzten Erfolg [%s]",
+                               exc, errors, await _knoten(scanner_node))
             # 🛑 Das Geraet NICHT bei jedem Fehler neu suchen. Die Suche
             # (`scanimage -f`) ist der langsame Pfad — sie durchkaemmt alle
             # SANE-Backends und belegt dabei den USB-Anschluss. Die erste
@@ -365,8 +395,22 @@ async def watch_button(
             # sich im Takt. Am 2026-09-25 hat das den Scanner festgesetzt, bis
             # er vom Strom genommen wurde.
             # Erst nach mehreren Fehlschlaegen in Folge neu suchen.
-            if errors >= REDISCOVER_AFTER:
+            #
+            # 🛑 Und danach ZURUECKSETZEN. Bis 2026-10-12 stand hier
+            # `errors >= REDISCOVER_AFTER`, und `errors` wird ausschliesslich im
+            # Erfolgszweig genullt — die Bedingung wurde also einmal wahr und
+            # blieb es fuer immer: ab dem dritten Fehlschlag lief die
+            # Vollaufzaehlung in JEDEM Takt. Die Reparatur vom 2026-09-25 hatte
+            # damit nur den Beginn um drei Takte verschoben, nicht den
+            # Dauerzustand beseitigt. Gemessen am 2026-10-12: 4956 Versuche in
+            # 15,3 h = 11,11 s je Versuch, und Suche (6,17 s) + ERROR_BACKOFF
+            # (5,0 s) = 11,17 s — die Suche steckte in jedem einzelnen Versuch.
+            # Mit dem Vorsatz des Kommentars (eine Suche je drei Fehlschlaege)
+            # faellt die Belegung des USB-Anschlusses von 55,2 % auf 29,1 %.
+            since_rediscover += 1
+            if since_rediscover >= REDISCOVER_AFTER:
                 device = None
+                since_rediscover = 0
             pressed_before = False
             # Ein VOLLENDETER Durchlauf — auch dieser hier. Begründung zur
             # Stelle der Marke s. unten am Ende des Erfolgszweigs.
@@ -378,6 +422,7 @@ async def watch_button(
             logger.info("Knopfwächter: Sensor wieder lesbar nach %d Fehlversuch(en)",
                         errors)
             errors = 0
+            since_rediscover = 0
 
         pressed = sensors.scan_button
         # FLANKE, nicht Zustand: ein gehaltener Knopf darf nicht zwei Scans

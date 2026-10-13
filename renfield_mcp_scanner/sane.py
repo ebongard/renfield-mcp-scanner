@@ -8,9 +8,11 @@ its behaviour is what the measurements in pipeline.py were taken against.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import re
 import shutil
+import weakref
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -41,6 +43,68 @@ class ScannerBusyError(ScannerError):
     """The device is already scanning."""
 
 
+class DeviceContendedError(ScannerError):
+    """Eine andere Probe hielt das Gerät länger als die Wartegrenze.
+
+    🛑 Eigene Klasse, damit ein ZUSAMMENSTOSS in der Auswertung nicht wie ein
+    Verklemmen aussieht. Fünf Aufrufer lösen `find_device` unabhängig aus
+    (`scan.py:35`, `button.py:339`, `tools.py:31`, `tools.py:61`,
+    `tools.py:135`); bis 2026-10-12 ohne jede Serialisierung. Zwei davon laufen
+    regelmässig gegeneinander, und das erklärt den Befund „`scanner_status`
+    scheitert, während der Wächter im selben Prozess erfolgreich liest": nicht
+    zwei Sichten auf einen Zustand, sondern zwei Öffner, von denen einer
+    verliert.
+    """
+
+
+#: Serialisiert die BILLIGEN Geräteproben gegeneinander.
+#:
+#: 🛑 NUR die Proben — `scan_batch` läuft ausdrücklich OHNE dieses Schloss.
+#: Gegengerechnet am 2026-10-12: ein Scan darf 1800 s dauern, die
+#: Lebendigkeitsgrenze des Wächters liegt bei `LIVENESS_STALE_AFTER` = 370 s
+#: (2 × (60 + 2×60 + 5)). Würde das Schloss über den Scan gehalten, käme der
+#: Wächter 1800 s nicht durch seinen Durchlauf und die Aufsicht erklärte den
+#: blauen Knopf bei JEDEM langen Scan für tot — ein Fehlalarm auf den
+#: Normalfall, also genau das, was `LIVENESS_FACTOR` verhindern soll. Die
+#: Probe-gegen-Scan-Serialisierung braucht deshalb eine Änderung AM WÄCHTER
+#: (nicht anstehen, sondern den Takt überspringen) und gehört nicht in diese
+#: Stufe.
+#: 🛑 Je EREIGNISSCHLEIFE, nicht je Modul. `asyncio.Lock()` bindet sich beim
+#: ersten Gebrauch an die laufende Schleife und wirft danach in jeder anderen
+#: („is bound to a different event loop"). Ein Schloss auf Modulebene lief im
+#: Dienst durch — er hat genau eine Schleife — und riss im zweiten
+#: asynchronen Test. Ein Riegel, der nur in der Produktion hält und im Test
+#: wirft, ist kein Riegel: er ist unprüfbar. Schwache Schlüssel, damit
+#: beendete Schleifen nicht hängenbleiben.
+_PROBE_LOCKS: weakref.WeakKeyDictionary[
+    asyncio.AbstractEventLoop, asyncio.Lock
+] = weakref.WeakKeyDictionary()
+
+
+def _probe_lock() -> asyncio.Lock:
+    """Das Schloss der laufenden Schleife.
+
+    🛑 **Reichweite: EIN Prozess, EINE Ereignisschleife.** Das ist kein
+    Versehen, aber auch keine Nebensache — ein Schloss je Schleife ist der
+    Fehler des modulweiten Schlosses, nur umgedreht: es serialisiert
+    innerhalb einer Schleife und schweigt über alles darüber hinaus. Liefe je
+    ein Aufrufer in einem eigenen Thread mit eigener Schleife, bekäme jeder
+    sein eigenes Schloss und die Serialisierung wäre **still** weg — ohne
+    Ausnahme, ohne Zeile. Heute laufen alle fünf Aufrufer in derselben
+    Schleife desselben Dienstes; wer das ändert, muss hierher zurück.
+
+    🛑 **Den sechsten Aufrufer erreicht der Riegel grundsätzlich nicht:** ein
+    `scanimage` von Hand, aus einer Shell, aus Chromes Geräteaufzählung. Das
+    ist eine GRENZE, keine Lücke — sie steht hier, damit sie später niemand
+    für eine Zusage hält.
+    """
+    loop = asyncio.get_running_loop()
+    lock = _PROBE_LOCKS.get(loop)
+    if lock is None:
+        lock = _PROBE_LOCKS[loop] = asyncio.Lock()
+    return lock
+
+
 @dataclass
 class ScanResult:
     pages: list[Path]
@@ -63,6 +127,21 @@ class Sensors:
 
     @property
     def ready(self) -> bool:
+        """🛑 Leere Sensoren sind NICHT „bereit".
+
+        Bis 2026-10-12 verwarf `read_sensors` den Exit-Status, und ein
+        fehlgeschlagener Abruf ergab `raw={}` → alle Sensoren `False` →
+        `error_code=0` → **`ready is True`**. Ein verklemmtes Gerät meldete
+        damit „bereit, kein Papier", ohne eine einzige Protokollzeile. Das
+        war nicht nur ein stiller Fehlschlag, es machte die Ursache des
+        Verklemmens UNBEOBACHTBAR: `device` blieb gesetzt, `errors` blieb 0,
+        und die Gerätesuche lief nie wieder — ein Ausfall im Dauerbetrieb
+        wurde erst beim nächsten Neustart laut, der dann wie die Ursache
+        aussah. `read_sensors` wirft jetzt; dieser Riegel hier deckt jede
+        andere Herkunft eines `Sensors`-Satzes ab.
+        """
+        if not self.raw:
+            return False
         return not self.cover_open and self.error_code == 0
 
 
@@ -77,25 +156,67 @@ async def _run(*args: str, timeout: float = 600.0) -> tuple[int, str]:
     try:
         out, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
     except asyncio.TimeoutError:
-        # kill() SENDET nur das Signal. Ohne das Warten kehrt _run zurueck,
-        # waehrend der Prozess das USB-Geraet noch haelt — der naechste Aufruf
-        # findet dann "no Fujitsu scanner found". Kurz begrenzt, damit ein in
-        # ununterbrechbarer USB-E/A steckender Prozess uns nicht mitnimmt.
-        proc.kill()
-        try:
-            await asyncio.wait_for(proc.wait(), timeout=5.0)
-        except asyncio.TimeoutError:
-            logger.warning("scanimage %s liess sich nach dem Abbruch nicht beenden "
-                           "— das Geraet bleibt moeglicherweise belegt", proc.pid)
+        _reap(proc)
         raise ScannerError(f"scanimage timed out after {timeout}s") from None
+    except BaseException:
+        # 🛑 JEDE andere Beendigung raeumt ebenfalls auf — vor allem
+        # `CancelledError`. Bis 2026-10-12 toetete nur die Zeitablauf-Bahn den
+        # Prozess; wird die wartende Aufgabe abgebrochen (Dienstende, ein
+        # aeusseres Zeitlimit, ein abgebrochener Auftrag), kehrte `_run` zurueck
+        # und liess ein `scanimage` zurueck, das das USB-Geraet weiter hielt.
+        # Der naechste Aufruf fand dann "no Fujitsu scanner found" — ein
+        # Fehlerbild, das wie ein Geraetedefekt aussieht und von uns stammt.
+        _reap(proc)
+        raise
     return proc.returncode or 0, out.decode("utf-8", "replace")
+
+
+def _reap(proc: asyncio.subprocess.Process) -> None:
+    """Toetet einen noch laufenden `scanimage` SYNCHRON.
+
+    🛑 Kein `await`. Im Abbruchfall ist die Aufgabe bereits am Abbrechen, und
+    ein `await` koennte sofort wieder mit `CancelledError` herausfahren — der
+    Prozess blieb dann trotz Aufraeumens stehen. `kill()` ist synchron und ist
+    der entscheidende Teil: es gibt das USB-Geraet frei. Das Einsammeln des
+    Zombies uebernimmt die Kinderaufsicht der Ereignisschleife.
+    """
+    if proc.returncode is not None:
+        return
+    with contextlib.suppress(ProcessLookupError):
+        proc.kill()
+
+
+async def _probe(*args: str, timeout: float) -> tuple[int, str]:
+    """`_run` fuer die billigen Proben — serialisiert, mit Wartegrenze.
+
+    Die Wartegrenze ist `timeout`: laenger zu warten als die Probe selbst
+    dauern darf, bringt nichts und verlaengerte nur die Luecke, die der
+    Waechter in seine Lebendigkeitsgrenze einrechnet.
+    """
+    lock = _probe_lock()
+    try:
+        await asyncio.wait_for(lock.acquire(), timeout=timeout)
+    except asyncio.TimeoutError:
+        raise DeviceContendedError(
+            f"eine andere Geraeteprobe hielt das Geraet laenger als {timeout:.0f}s"
+        ) from None
+    try:
+        return await _run(*args, timeout=timeout)
+    finally:
+        lock.release()
+
+
+def _last_line(out: str) -> str:
+    """Letzte nichtleere Zeile — die Meldung des Geraets, nicht der ganze Strom."""
+    lines = [ln.strip() for ln in out.splitlines() if ln.strip()]
+    return lines[-1] if lines else "(keine Ausgabe)"
 
 
 async def find_device(preferred: str = "") -> str:
     """Resolve the scanner device name. Empty preference -> first Fujitsu."""
     if preferred:
         return preferred
-    _, out = await _run("-f", "%d%n", timeout=PROBE_TIMEOUT)
+    _, out = await _probe("-f", "%d%n", timeout=PROBE_TIMEOUT)
     for line in out.splitlines():
         if "fujitsu" in line.lower():
             return line.strip()
@@ -104,10 +225,25 @@ async def find_device(preferred: str = "") -> str:
 
 async def read_sensors(device: str) -> Sensors:
     """Read the live sensor group. Cheap, and the basis of scanner_status."""
-    _, out = await _run("-d", device, "-A", timeout=PROBE_TIMEOUT)
+    status, out = await _probe("-d", device, "-A", timeout=PROBE_TIMEOUT)
+    # 🛑 ZWEI verschiedene Fehlschlaege, getrennt gemeldet. Deckte einer den
+    # anderen mit ab, waere hinterher nicht erkennbar, welcher gefeuert hat.
+    if status != 0:
+        raise ScannerError(
+            f"Sensorabruf fehlgeschlagen (scanimage endete mit {status}): "
+            f"{_last_line(out)}"
+        )
     raw: dict[str, str] = {}
     for m in re.finditer(r"^\s+--([a-z0-9-]+)\[?=?.*?\[(\w+)\]\s*\[hardware\]", out, re.M):
         raw[m.group(1)] = m.group(2)
+    if not raw:
+        # Status 0, aber keine einzige Hardware-Option: das Geraet hat
+        # geantwortet, die Antwort passt aber nicht zum Muster (anderes
+        # Backend, andere scanimage-Fassung, abgeschnittene Ausgabe).
+        raise ScannerError(
+            "Sensorabruf lieferte keine einzige Hardware-Option — "
+            f"Ausgabe passt nicht zum Muster: {_last_line(out)}"
+        )
     yes = lambda k: raw.get(k, "no") == "yes"  # noqa: E731
     code = raw.get("error-code", "0")
     return Sensors(
