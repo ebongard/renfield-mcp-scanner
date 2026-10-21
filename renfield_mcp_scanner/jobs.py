@@ -537,21 +537,6 @@ class JobManager:
         self._tasks.add(task)
         task.add_done_callback(self._tasks.discard)
 
-    @property
-    def scan_in_flight(self) -> bool:
-        """Läuft gerade ein Scan? DIE eine Quelle für diese Frage.
-
-        🛑 Zwei Stellen brauchen sie, und sie dürfen nicht auseinanderlaufen:
-        der Knopfwächter (er muss den Sensorabruf überspringen) und
-        `watcher_health` (es darf den Zusammenstoß nicht „verklemmt" nennen).
-        Am 2026-10-21 gemessen: während eines Knopf-Scans scheiterte der
-        Sensorabruf 4× über 31 s mit „open of device failed" — der Scan hält
-        den Einzug, das ist der NORMALFALL. Ohne diese Abfrage meldete die
-        Probe dafür `device_wedged`, und der Fehlerpfad löste nach drei
-        Fehlschlägen noch eine 6-Sekunden-Vollsuche aus, mitten im Scan.
-        """
-        return self._active is not None
-
     async def start(self, *, caller: str | None, target: str, title: str) -> dict:
         async with self._lock:
             if self._active is not None:

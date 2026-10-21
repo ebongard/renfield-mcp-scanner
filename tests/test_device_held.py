@@ -20,6 +20,8 @@ Beide hängen an einer Frage, und die hat jetzt EINE Quelle:
 """
 from __future__ import annotations
 
+import pytest
+
 from renfield_mcp_scanner import button, tools, usb
 from renfield_mcp_scanner.sane import Sensors
 
@@ -71,7 +73,7 @@ class TestDerWaechterFasstDasGeraetWaehrendEinesScansNICHTAn:
         await button.watch_button(
             _Cfg(), f.start_job, read_sensors=f.read_sensors,
             find_device=f.find_device, scanner_node=f.scanner_node,
-            scan_in_flight=f.scan_laeuft, sleep=f.sleep, max_iterations=5,
+            device_held=f.scan_laeuft, sleep=f.sleep, max_iterations=5,
         )
         assert f.reads == 0, (
             f"während eines Scans darf KEIN Sensorabruf laufen — {f.reads} gezählt")
@@ -101,7 +103,7 @@ class TestDerWaechterFasstDasGeraetWaehrendEinesScansNICHTAn:
         await button.watch_button(
             _Cfg(), f.start_job, read_sensors=f.read_sensors,
             find_device=f.find_device, scanner_node=f.scanner_node,
-            scan_in_flight=f.scan_laeuft, sleep=f.sleep, liveness=leben,
+            device_held=f.scan_laeuft, sleep=f.sleep, liveness=leben,
             max_iterations=4,
         )
         assert leben.marken == 4, (
@@ -116,7 +118,7 @@ class TestDerWaechterFasstDasGeraetWaehrendEinesScansNICHTAn:
         await button.watch_button(
             _Cfg(), f.start_job, read_sensors=f.read_sensors,
             find_device=f.find_device, scanner_node=f.scanner_node,
-            scan_in_flight=f.scan_laeuft, sleep=f.sleep, max_iterations=5,
+            device_held=f.scan_laeuft, sleep=f.sleep, max_iterations=5,
         )
         assert f.finds == 1, "nach dem Scan muss das Gerät einmal gesucht werden"
         assert f.reads == 3, f"und die restlichen Takte normal lesen — {f.reads}"
@@ -136,10 +138,10 @@ class TestDieProbeNenntEinenLaufendenScanNichtVerklemmt:
 
         r = await tools.watcher_health(
             _Cfg(), liveness=_L(), scanner_node=knoten,
-            scan_in_flight=lambda: True)
+            device_held=lambda: True)
         assert r["ok"] is True, (
             "ein laufender Scan ist der Normalfall, kein Befund")
-        assert r["scan_in_flight"] is True
+        assert r["device_held"] is True
 
     async def test_OHNE_laufenden_scan_ist_derselbe_zustand_verklemmt(self):
         """🛑 Die Gegenprobe. Ohne sie prüfte der Test oben nur, dass
@@ -157,15 +159,131 @@ class TestDieProbeNenntEinenLaufendenScanNichtVerklemmt:
 
         r = await tools.watcher_health(
             _Cfg(), liveness=_L(), scanner_node=knoten,
-            scan_in_flight=lambda: False)
+            device_held=lambda: False)
         assert r["ok"] is False
         assert r["error_code"] == "device_wedged"
 
 
-class TestEineQuelle:
-    async def test_der_jobmanager_ist_die_quelle(self):
-        """Beide Verwender fragen `JobManager.scan_in_flight` — nicht zwei
-        eigene Zustände, die auseinanderlaufen."""
-        from renfield_mcp_scanner.jobs import JobManager
+class TestEineQuelleUndSieIstBEGRENZT:
+    """🛑 Im Review zu #10 umgestellt, und das ist der Kern.
 
-        assert isinstance(JobManager.scan_in_flight, property)
+    Die erste Fassung fragte `JobManager._active`, also „läuft ein Auftrag".
+    Das umfasst Zusammenbau, OCR und Klassifizierung — und `img2pdf`/
+    `ocrmypdf` laufen über `asyncio.to_thread` OHNE Zeitgrenze und
+    unabbrechbar. Eine hängende OCR hätte die Probe DAUERHAFT verstummt und
+    die Zeitmarke grün gehalten: der Neun-Tage-Ausfall durch eine neue Tür.
+
+    Jetzt zählt `sane` die Scans, die das Gerät wirklich halten, und das ist
+    genau `scan_batch` — begrenzt durch sein eigenes `timeout=1800`.
+    Unbegrenztes Schweigen ist damit strukturell unmöglich, ohne eine
+    gewählte Frist.
+    """
+
+    def test_die_quelle_liegt_dort_wo_das_geraet_geoeffnet_wird(self):
+        from renfield_mcp_scanner import sane
+
+        assert callable(sane.device_held)
+        assert sane.device_held() is False, "im Ruhezustand hält nichts das Gerät"
+
+    async def test_der_zaehler_wird_auch_bei_einer_AUSNAHME_geraeumt(self, tmp_path,
+                                                                     monkeypatch):
+        """Ein Schalter, den nur der Erfolgspfad zurücknimmt, bleibt hängen —
+        und ein hängender Zähler ist genau das unbegrenzte Schweigen."""
+        from renfield_mcp_scanner import sane
+
+        async def boom(*a, **k):
+            raise sane.ScannerError("Gerät weg")
+
+        monkeypatch.setattr(sane, "_run", boom)
+        with pytest.raises(sane.ScannerError):
+            await sane.scan_batch(
+                "fujitsu:test", tmp_path, source="ADF Duplex", mode="Color",
+                resolution=300, page_height_mm=297.0)
+        assert sane.device_held() is False, (
+            "nach einer Ausnahme darf der Zähler nicht stehen bleiben — sonst "
+            "schweigt die Probe für immer")
+
+    async def test_waehrend_scan_batch_IST_das_geraet_gehalten(self, tmp_path,
+                                                               monkeypatch):
+        """Gegenprobe: ohne sie bewiesen die Tests oben nur, dass der Zähler
+        nie hochgeht."""
+        from renfield_mcp_scanner import sane
+
+        gesehen = []
+
+        async def mitschauen(*a, **k):
+            gesehen.append(sane.device_held())
+            return 0, "out of documents"
+
+        monkeypatch.setattr(sane, "_run", mitschauen)
+        await sane.scan_batch(
+            "fujitsu:test", tmp_path, source="ADF Duplex", mode="Color",
+            resolution=300, page_height_mm=297.0)
+        assert gesehen == [True], "während des Geräteaufrufs muss es gehalten sein"
+        assert sane.device_held() is False, "und danach frei"
+
+
+class TestEinGEHALTENERKnopfStartetKeinenZweitenScan:
+    """🛑 Im Review zu #10 gefunden.
+
+    Der Überspring-Zweig setzte `pressed_before = False`. Der echte Ablauf:
+
+        Takt 1  Knopf gedrückt gesehen  -> Flanke, Scan startet
+        Takt 2  Gerät gehalten          -> übersprungen
+        Takt 3  Gerät gehalten          -> übersprungen
+        Takt 4  Gerät frei, Knopf NOCH gedrückt
+
+    Mit `pressed_before = False` im Überspring-Zweig läse Takt 4
+    `pressed=True` bei `pressed_before=False`, also eine Flanke, die es nie
+    gab — und startete einen ZWEITEN Scan mit leerem Einzug.
+
+    Nicht geprüft wird der Fall, dass der Wächter den ersten Druck NIE gesehen
+    hat (Dienststart mitten in einem Scan). Dort ist ein Scan beim ersten
+    lesbaren Takt richtig: der Wächter kann es nicht wissen, und ihm ein
+    Gedächtnis über den Scan hinweg zu geben hieße, einen Druck während des
+    Scans nachträglich wirken zu lassen — bei einem Stapel fast immer
+    unerwünscht, es gibt nur einen Einzug.
+    """
+
+    async def test_der_SCHON_GESEHENE_druck_feuert_nicht_erneut(self):
+        from renfield_mcp_scanner.sane import Sensors
+
+        class _Gehalten:
+            """Knopf durchgehend gedrückt. Das Gerät ist in Takt 2 und 3
+            gehalten — als hielte der Scan es, den Takt 1 ausgelöst hat."""
+
+            def __init__(self):
+                self.takt = 0
+                self.jobs = 0
+
+            def haelt(self) -> bool:
+                self.takt += 1
+                return self.takt in (2, 3)
+
+            async def find_device(self, _hint):
+                return "fujitsu:test"
+
+            async def read_sensors(self, _device):
+                return Sensors(raw={"scan": "yes", "page-loaded": "yes"},
+                               scan_button=True, page_loaded=True)
+
+            async def scanner_node(self):
+                return None
+
+            async def sleep(self, _s):
+                return None
+
+            async def start_job(self, **_kw):
+                self.jobs += 1
+                return {"job_id": f"j{self.jobs}"}
+
+        f = _Gehalten()
+        await button.watch_button(
+            _Cfg(), f.start_job, read_sensors=f.read_sensors,
+            find_device=f.find_device, scanner_node=f.scanner_node,
+            device_held=f.haelt, sleep=f.sleep, max_iterations=5,
+        )
+        assert f.jobs == 1, (
+            f"ein durchgehend gehaltener Knopf ist EIN Druck; {f.jobs} Scans "
+            "gestartet. Mit `pressed_before = False` im Überspring-Zweig wären "
+            "es zwei — der zweite mit leerem Einzug")

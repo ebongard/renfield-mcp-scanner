@@ -94,8 +94,7 @@ async def watcher_health() -> dict:
     reads the real sensors.
     """
     config, _ = _ctx()
-    return await t.watcher_health(
-        config, scan_in_flight=lambda: _job_manager().scan_in_flight)
+    return await t.watcher_health(config)
 
 
 @mcp.tool()
@@ -309,12 +308,7 @@ async def _serve() -> None:
         # war der blaue Knopf sieben Tage ohne Wirkung. Begründung im
         # Docstring dort.
         button_task = asyncio.create_task(
-            supervise_button(
-                _config, lambda **kw: _job_manager().start(**kw),
-                # Dieselbe Quelle wie `watcher_health` — der Wächter darf das
-                # Gerät nicht abfragen, während der Scan es hält.
-                scan_in_flight=lambda: _job_manager().scan_in_flight,
-            ),
+            supervise_button(_config, lambda **kw: _job_manager().start(**kw)),
             name="scanner-button-watch",
         )
         # 🛑 Und ein Abschluss-Rückruf, weil die starke Referenz oben Pythons

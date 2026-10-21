@@ -408,14 +408,40 @@ vorhandenem USB-Knoten und meldete `device_wedged` — ein Fehlalarm auf den
 normalsten Zustand überhaupt —, und nach drei Fehlschlägen löste der
 Fehlerpfad eine 6-Sekunden-Vollsuche aus, mitten im laufenden Scan.
 
-Beide hängen an einer Frage, und die hat EINE Quelle:
-`JobManager.scan_in_flight`. Der Wächter überspringt den Takt, und die Probe
-meldet `ok`.
+Beide hängen an einer Frage, und die hat EINE Quelle: `sane.device_held()`,
+ein Zähler in dem Modul, das das Gerät öffnet. Der Wächter überspringt den
+Takt, und die Probe meldet `ok`.
+
+🛑 **Die Quelle ist die PHASE, nicht der Auftrag — und das ist der Unterschied
+zwischen begrenzt und unbegrenzt.** Die erste Fassung fragte
+`JobManager._active`, also „läuft ein Auftrag". Das umfasst Zusammenbau, OCR
+und Klassifizierung, und `img2pdf`/`ocrmypdf` laufen über `asyncio.to_thread`
+**ohne Zeitgrenze und unabbrechbar**. Eine hängende OCR hätte den Auftrag für
+immer „laufend" gehalten: die Probe dauerhaft verstummt, die Zeitmarke grün,
+der Knopf tot — der Neun-Tage-Ausfall durch eine neue Tür. Im Review zu #10
+gefunden.
+
+Das Gerät wird nur während `scan_batch` gehalten, und das ist durch sein
+eigenes `timeout=1800` begrenzt. **Unbegrenztes Schweigen ist damit
+strukturell unmöglich, ohne eine gewählte Frist.** Nebengewinn: nach dem Scan
+ist der Einzug frei, der Knopf ist während der OCR bedienbar statt unnötig
+taub.
+
+Ein **Zähler**, kein Schalter: ein Schalter, den zwei Pfade setzen und einer
+zurücknimmt, bleibt irgendwann hängen. Er wird im `finally` geräumt, auch bei
+einer Ausnahme — ein Test hält genau das fest, denn ein hängender Zähler *ist*
+das unbegrenzte Schweigen.
 
 🛑 **Der übersprungene Takt setzt die Zeitmarke trotzdem.** Ein Scan darf
 1800 s dauern, `LIVENESS_STALE_AFTER` liegt bei 370 s — ohne die Marke
 erklärte die Aufsicht den Knopf bei JEDEM langen Scan für tot. Genau der
 Fehlalarm, den das Nicht-Sperren von `scan_batch` vermeiden soll.
+
+🛑 **`pressed_before` bleibt im Überspring-Zweig UNBERÜHRT.** Es dort auf
+`False` zu setzen erfände eine Flanke: endet der Scan, während der Knopf noch
+gedrückt ist, läse der nächste Takt `pressed=True` bei `pressed_before=False`
+und startete einen zweiten Scan — mit leerem Einzug. Ein Druck, den der
+Wächter schon gesehen hat, ist EIN Druck.
 
 ### Die Fertigmeldung eines Knopf-Scans hat keinen Empfänger
 

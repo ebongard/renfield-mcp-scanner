@@ -55,6 +55,34 @@ PROBE_TIMEOUT = 60.0
 #: verfälschen höchstens eine Anzeige, nicht das Verhalten.
 REQUIRED_SENSORS = ("scan", "page-loaded")
 
+#: Wie viele Scans halten das Gerät gerade? EIN Zähler, DIE eine Quelle für
+#: „der Einzug ist belegt" — gelesen vom Knopfwächter (er überspringt dann den
+#: Sensorabruf) und von `watcher_health` (es nennt den Zusammenstoß dann nicht
+#: „verklemmt").
+#:
+#: 🛑 Warum HIER und nicht am Auftrag. Die erste Fassung fragte
+#: `JobManager._active`, also „läuft ein Auftrag". Das umfasst auch Zusammenbau,
+#: OCR und Klassifizierung — und `img2pdf`/`ocrmypdf` laufen über
+#: `asyncio.to_thread` OHNE Zeitgrenze und unabbrechbar (`pdf.py`). Eine
+#: hängende OCR hätte den Auftrag für immer „laufend" gehalten, die Probe
+#: dauerhaft verstummt und die Zeitmarke grün — der Neun-Tage-Ausfall durch
+#: eine neue Tür. Im Review zu #10 gefunden.
+#:
+#: Das Gerät wird NUR während `scan_batch` gehalten, und das ist durch sein
+#: eigenes `timeout=1800` begrenzt: unbegrenztes Schweigen ist damit
+#: strukturell unmöglich, ohne eine gewählte Frist. Nach dem Scan ist der
+#: Einzug frei, und der Wächter darf wieder lesen — der Knopf ist während der
+#: OCR also bedienbar statt unnötig taub.
+#:
+#: Ein Zähler, kein Schalter: ein Schalter, den zwei Pfade setzen und einer
+#: zurücknimmt, bleibt irgendwann hängen.
+_DEVICE_HELD = 0
+
+
+def device_held() -> bool:
+    """Hält ein laufender Scan gerade den Einzug?"""
+    return _DEVICE_HELD > 0
+
 
 class ScannerError(RuntimeError):
     """A scanner fault. Carries the device's own message."""
@@ -307,16 +335,21 @@ async def scan_batch(
     worse than a loud failure because it is found only when the page is needed.
     """
     out_dir.mkdir(parents=True, exist_ok=True)
-    status, log = await _run(
-        "-d", device,
-        "--source", source, "--mode", mode, "--resolution", str(resolution),
-        "--page-height", str(page_height_mm),
-        "--swdeskew=yes" if deskew else "--swdeskew=no",
-        "--swcrop=yes" if crop else "--swcrop=no",
-        "--swskip", str(skip_blank),
-        "--format=png", f"--batch={out_dir}/p%04d.png",
-        timeout=timeout,
-    )
+    global _DEVICE_HELD
+    _DEVICE_HELD += 1
+    try:
+        status, log = await _run(
+            "-d", device,
+            "--source", source, "--mode", mode, "--resolution", str(resolution),
+            "--page-height", str(page_height_mm),
+            "--swdeskew=yes" if deskew else "--swdeskew=no",
+            "--swcrop=yes" if crop else "--swcrop=no",
+            "--swskip", str(skip_blank),
+            "--format=png", f"--batch={out_dir}/p%04d.png",
+            timeout=timeout,
+        )
+    finally:
+        _DEVICE_HELD -= 1
     pages = sorted(out_dir.glob("p*.png"))
     detail = "\n".join(
         ln for ln in log.splitlines()
