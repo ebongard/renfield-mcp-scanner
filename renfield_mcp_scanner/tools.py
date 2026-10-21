@@ -125,8 +125,13 @@ async def watcher_health(
     nutzlast = {"button_watcher": verdict, "usb_node": knoten}
 
     if verdict["finding"]:
-        code = ("watcher_crashloop" if verdict["state"] == button.WATCHER_CRASHLOOP
-                else "watcher_dead")
+        # 🛑 Die Abbildung steht in `button.WATCHER_FINDING_CODES`, NICHT hier.
+        # Eine zweite Verzweigung über dieselbe Zustandsmenge driftet: ein neu
+        # eingeführter Befund-Zustand käme hier als „watcher_dead" heraus.
+        # Fehlt ein Zustand in der Abbildung, ist der Code `watcher_finding` —
+        # unspezifisch, aber ein ALARM, nie ein falsches Etikett und nie ein
+        # verschwiegener Befund.
+        code = button.WATCHER_FINDING_CODES.get(verdict["state"], "watcher_finding")
         return {**_err(verdict["detail"], code), **nutzlast}
 
     if (verdict["state"] == button.WATCHER_ALIVE

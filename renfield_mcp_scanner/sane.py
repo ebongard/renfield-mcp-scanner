@@ -34,6 +34,27 @@ _BENIGN = re.compile(r"out of documents|rounded value")
 #: einzeln, liefe sie beim nächsten Umbau auseinander.
 PROBE_TIMEOUT = 60.0
 
+#: 🛑 Die Sensoren, von denen das VERHALTEN des Wächters abhängt. Fehlt einer,
+#: ist die Sensorgruppe für den blauen Knopf unbrauchbar — und zwar STILL:
+#:
+#:   * `scan` fehlt        → `yes("scan")` liest `raw.get("scan","no")` → der
+#:                           Knopfdruck ist für immer unsichtbar.
+#:   * `page-loaded` fehlt → der Takt bleibt bei `IDLE_INTERVAL` (1,0 s) statt
+#:                           `ARMED_INTERVAL` (0,2 s), und der ~200-ms-Impuls
+#:                           des Knopfes geht verloren.
+#:
+#: Bis 2026-10-21 warf `read_sensors` nur bei VOLLSTÄNDIG leerem `raw`. Eine
+#: Teilmenge — etwa nach einer `scanimage`-Fassung mit leicht geändertem
+#: Optionsformat, auf die die Regex nur noch teilweise passt — ergab `raw`
+#: nicht leer, keinen Wurf, `ready=True`, `device_readable=True` und einen
+#: toten Knopf ohne eine einzige Protokollzeile. Genau der Ausfall, der neun
+#: Tage gekostet hat, nur durch eine engere Tür. Im Review zu #9 gefunden.
+#:
+#: Die übrigen Felder (`cover-open`, `error-code`, `power-save`,
+#: `double-feed`) tragen den Knopf nicht und dürfen fehlen; ihre Vorgaben
+#: verfälschen höchstens eine Anzeige, nicht das Verhalten.
+REQUIRED_SENSORS = ("scan", "page-loaded")
+
 
 class ScannerError(RuntimeError):
     """A scanner fault. Carries the device's own message."""
@@ -243,6 +264,14 @@ async def read_sensors(device: str) -> Sensors:
         raise ScannerError(
             "Sensorabruf lieferte keine einzige Hardware-Option — "
             f"Ausgabe passt nicht zum Muster: {_last_line(out)}"
+        )
+    fehlend = [k for k in REQUIRED_SENSORS if k not in raw]
+    if fehlend:
+        # Eine TEILMENGE ist gefaehrlicher als nichts: ohne diesen Riegel
+        # melden die fehlenden Felder ihre Vorgabe ("no") als Messwert.
+        raise ScannerError(
+            f"Sensorabruf ohne die Felder, die der Knopf braucht: "
+            f"{', '.join(fehlend)} (gelesen: {', '.join(sorted(raw)) or 'keine'})"
         )
     yes = lambda k: raw.get(k, "no") == "yes"  # noqa: E731
     code = raw.get("error-code", "0")
