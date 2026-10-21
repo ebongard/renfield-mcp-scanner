@@ -268,6 +268,114 @@ aus den Augen verlieren.
 | `restarts_total` / `restart_streak` | Neustarts der Aufsicht insgesamt, und der Zähler aus ihrer Meldung |
 | `device_readable` | Ob der letzte Sensorabruf gelang — `false` ist KEIN Befund |
 
+### 🛑 Ein TOTER Wächter ist laut. Ein BLINDER war stumm.
+
+Die Lebendigkeit oben beantwortet „läuft die Schleife?" — nicht „sieht sie
+etwas?". Bis 2026-10-21 fielen die beiden Fragen auseinander, und die zweite
+hatte keine Antwort:
+
+`read_sensors` verwarf den Exit-Status von `scanimage`. Ein gescheiterter Abruf
+ergab `raw={}`, daraus alle Sensoren `False`, `error_code=0` — und damit
+`ready is True`. Keine Ausnahme. Also: `note_device(True)`, die Marke tickt,
+`device_readable` liest `true`, `errors` bleibt 0, `device` bleibt gesetzt,
+`find_device` läuft **nie wieder**. Der Wächter meldet „bereit, kein Papier"
+und tut das beliebig lange.
+
+**Gemessen am Haushalt:** der Prozess lief am 2026-10-21 seit neun Tagen ohne
+Neustart, und die letzte Zeile irgendeines Scanner-Bestandteils war vom
+2026-10-12 11:57. Ein Knopfdruck erzeugte keine Zeile, keinen Auftrag, nichts
+im Backend. Der blaue Knopf war wieder eine Woche tot — diesmal mit lebender
+Aufsicht, grüner Lebendigkeit und `device_readable: true`.
+
+Das ist NICHT der Ausfall vom 2026-10-04 (Task gestorben, Aufsicht fehlte); es
+ist sein Gegenstück, und #5/#6 greifen dagegen nicht. Was jetzt gilt:
+
+* `read_sensors` wirft auf **zwei getrennten Bahnen** — Exit-Status ≠ 0
+  (Backend-Fehler) und leeres Ergebnis bei Status 0 (Regex-/Formatfehler). Je
+  ein eigener Test: deckte eine die andere mit ab, wäre hinterher nicht
+  erkennbar, welche gefeuert hat.
+* `Sensors.ready` ist bei leerem `raw` **`False`** — für jede Herkunft eines
+  Satzes, nicht nur für `read_sensors`.
+* Damit wird `device_readable` zum ersten Mal wahrheitsfähig, und der
+  Fehlerpfad greift überhaupt.
+
+🛑 **Was das NICHT behebt.** Der Fehlerpfad kennt zwei Fälle, und sie verhalten
+sich entgegengesetzt:
+
+| Fall | was scheitert | `device` | wirkt `REDISCOVER_AFTER`? |
+|---|---|---|---|
+| **A** | `find_device` | bleibt `None` — die Zuweisung findet nicht statt | **nein**, `device = None` ist dann ein Leerlauf |
+| **B** | `read_sensors` | gesetzt | ja |
+
+Die acht Episoden vom 2026-10-11 waren **alle Fall A** (462 Warnzeilen, alle
+mit der Meldung aus `find_device`): gemessen 4956 Versuche über 15,3 h, 11,11 s
+je Versuch, und Suche (6,17 s) + `ERROR_BACKOFF` (5,0 s) = 11,17 s — die
+Vollaufzählung steckte in **jedem** Versuch, und kein Zähler ändert daran
+etwas. Fall B war in 33 Tagen nie aufgetreten, weil `read_sensors` nicht laut
+scheitern KONNTE. Die Rationierung (`since_rediscover`, zurückgesetzt beim
+Auslösen) gehört deshalb hierher, aber aus dem umgekehrten Grund: die
+Fehlschlag-Erkennung macht Fall B zum **ersten Mal erreichbar**, und ohne sie
+entstünde damit ein NEUER Dauerzustand mit Suche in jedem Takt. Ein eigener
+Test nagelt die Gegenbehauptung für Fall A fest (M Takte → M Suchen), damit
+„der Riegel ist repariert" nicht später für seine Behebung gehalten wird.
+
+### Die Proben sind serialisiert — und wie weit das reicht
+
+Fünf Aufrufer lösen `find_device` unabhängig aus (`scan.py`, `button.py`,
+`tools.py` dreimal), und `config.device` ist produktiv LEER, also sucht jeder
+von ihnen voll. Zwei davon laufen regelmäßig gegeneinander, und das erklärt den
+Befund „`scanner_status` scheitert, während der Wächter im selben Prozess
+erfolgreich liest": nicht zwei Sichten auf einen Zustand, sondern zwei Öffner,
+von denen einer verliert. Ein Zusammenstoß hat jetzt mit
+`DeviceContendedError` eine eigene Klasse — sonst sieht er in der Auswertung
+wie ein Verklemmen aus.
+
+🛑 Drei Grenzen, damit niemand mehr erwartet als da ist:
+
+* **Nur die Proben, nicht der Scan.** Ein Schloss über `scan_batch` würde bis
+  zu 1800 s gehalten, `LIVENESS_STALE_AFTER` liegt bei 370 s — die Aufsicht
+  erklärte den Knopf bei JEDEM langen Scan für tot. Probe gegen Scan zu
+  serialisieren braucht eine Änderung am Wächter (Takt überspringen statt
+  anstehen) und ist nicht gebaut.
+* **Reichweite: ein Prozess, eine Ereignisschleife.** Das Schloss liegt je
+  Schleife (ein `asyncio.Lock()` auf Modulebene bindet sich an die erste und
+  wirft in jeder weiteren — im Dienst unsichtbar, im zweiten Test sofort). Je
+  ein Aufrufer in einem eigenen Thread bekäme sein eigenes Schloss, und die
+  Serialisierung wäre still weg.
+* **Den sechsten Aufrufer erreicht es nicht:** ein `scanimage` von Hand,
+  Chromes Geräteaufzählung. Eine GRENZE, keine Lücke.
+
+Und `_run` räumt bei **jeder** Beendigung auf, vor allem bei
+`CancelledError`. Vorher tötete nur die Zeitablauf-Bahn den Prozess; wurde die
+wartende Aufgabe abgebrochen, blieb ein `scanimage` stehen, das das USB-Gerät
+weiter hielt — der nächste Aufruf fand „no Fujitsu scanner found", ein
+Fehlerbild, das wie ein Gerätedefekt aussieht und von uns stammt.
+
+### Die freie Diagnose am USB-Knoten
+
+`usb.py` liest über `ioreg` die Registratur des Kernels. Das öffnet das Gerät
+NICHT, belegt den Anschluss nicht und kann nichts verklemmen — darum darf es
+neben dem Geräte-Budget stehen. Ein Aufruf je **Ereignis** (Fund, Fehlschlag),
+nicht je Takt: er hängt an der gedrosselten Warnzeile.
+
+Er trennt „Scanner aus" von „Scanner verklemmt" — beides ergab vorher
+`ok:false`. Beim Stromlosmachen wechselt die `sessionID`, der SANE-Name
+`:10551` bleibt; `locationID` ist das zweite Merkmal, weil ein Verbund- oder
+Hub-Knoten mehr als einen Treffer liefern kann.
+
+🛑 **Auswahl über `idVendor`/`idProduct`, NIE über Einrückung.** Die erste
+Fassung las die Textausgabe von `ioreg` und trennte die Geräte an `^\+-o`;
+verschachtelte Knoten sind eingerückt und fallen in den Block ihres
+Elternteils. Der Treffer „ScanSnap" lag im Block eines Monitors, und die
+gelieferte `sessionID` war **dessen** — eine plausible Zahl vom falschen Gerät,
+die schlimmste Sorte Messwert, weil sie in der Auswertung nicht auffällt. Jetzt
+über den XML-plist (`ioreg -a`), ein Baum mit eigenen Merkmalen je Knoten. Ein
+Test hält fest, dass bei ABWESENDEM Scanner keine fremde Kennung zurückkommt.
+
+🛑 **Die Grenze der Auskunft:** im verklemmten Zustand ist der Knoten
+weiterhin VORHANDEN (gemessen). Sie ist ein Abbruch- und Diagnosesignal, kein
+Aufwachsignal — „Knoten da" beweist nicht „Gerät benutzbar".
+
 ## Tools
 
 | Tool | Purpose |
