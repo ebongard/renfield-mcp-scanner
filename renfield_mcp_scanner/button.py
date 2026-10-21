@@ -132,6 +132,20 @@ WATCHER_ALIVE = "alive"
 WATCHER_DEAD = "dead"
 WATCHER_CRASHLOOP = "crashloop"
 
+#: Fehlercode je BEFUND-Zustand — EINE Abbildung, nicht zwei.
+#:
+#: 🛑 `watcher_health` leitete den Code anfangs selbst aus dem Zustand ab und
+#: schaltete damit ein ZWEITES Mal über diese Menge. Ein neuer Zustand mit
+#: `finding=True` wäre dort stillschweigend als `watcher_dead` beschriftet
+#: worden — dieselbe Drift wie am 2026-10-04 in `scanner_jobs.py`, wo eine
+#: zweite Verzweigung über dieselbe Statusmenge zwei Zustände vergaß. Wer hier
+#: einen Befund-Zustand hinzufügt, MUSS ihn hier eintragen; fehlt er, fällt das
+#: in `watcher_health` sofort auf, statt still falsch zu beschriften.
+WATCHER_FINDING_CODES = {
+    WATCHER_DEAD: "watcher_dead",
+    WATCHER_CRASHLOOP: "watcher_crashloop",
+}
+
 
 class WatcherLiveness:
     """Lebt der Knopfwächter? Die Antwort hängt an einer ZEITMARKE.

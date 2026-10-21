@@ -351,6 +351,47 @@ wartende Aufgabe abgebrochen, blieb ein `scanimage` stehen, das das USB-Gerät
 weiter hielt — der nächste Aufruf fand „no Fujitsu scanner found", ein
 Fehlerbild, das wie ein Gerätedefekt aussieht und von uns stammt.
 
+### `watcher_health` — das Werkzeug, auf das die Probe schaut
+
+Die Lebendigkeit oben ist nur dann etwas wert, wenn jemand sie LIEST. Bis
+2026-10-21 tat das niemand: der Scanner hatte im Backend gar keine
+Funktionssonde, mit dieser Begründung in `mcp_servers.yaml` — „liest `down`,
+wenn der Rechner schläft, erwartet, kein Fehler". Für den schlafenden Mac
+stimmt das, und das Rahmenwerk überspringt Proben für getrennte Server
+ohnehin. Nur hat dieselbe Begründung den zweiten Fall mitgedeckt: **Dienst
+läuft, Knopf tot.** Neun Tage, mit lebender Aufsicht und grüner Lebendigkeit.
+
+🛑 **Gesondet wird NICHT `scanner_status`.** Das fasst das Gerät an und gibt
+bei fehlendem Gerät eine Fehlerantwort zurück — ein ausgeschalteter Scanner ist
+der Normalfall, eine Probe darauf schlüge dauernd an und würde abgeschaltet.
+Eine Probe, die am Normalfall anschlägt, ist schlimmer als keine.
+
+`watcher_health` liest nur Kostenloses — die Zeitmarke des Wächters (im
+Speicher) und den USB-Knoten über `ioreg` — und **fasst das Gerät nicht an**.
+Nach dem 2026-10-21 ist das keine Nebensache: dort war der Scanner neun Tage am
+Bus angemeldet (unveränderte `sessionID`) und für SANE unansprechbar, OHNE dass
+eine einzige Gerätesuche gelaufen wäre. Eine Probe im Takt, die selbst öffnet,
+wäre Last auf genau dem Anschluss, dessen Gesundheit sie messen soll. Ein Test
+hält fest, dass sie SANE nicht aufruft — mit einer Gegenprobe, dass
+`scanner_status` es sehr wohl tut.
+
+| Wächter | `device_readable` | USB-Knoten | Ergebnis |
+|---|---|---|---|
+| `off` / `starting` | — | — | ok |
+| `dead` / `crashloop` | — | — | **Befund** (`watcher_dead` / `watcher_crashloop`) |
+| `alive` | `False` | **fehlt** | ok — Scanner aus, der Normalfall |
+| `alive` | `False` | **da** | **Befund** (`device_wedged`) |
+| `alive` | `False` | unbekannt | ok — eine fehlende Messung ist kein Fehler |
+| `alive` | `True` / `None` | — | ok |
+
+Die vorletzte Zeile ist die, die man vergisst: liefert `ioreg` keine Auskunft,
+wird daraus KEIN Befund. Sonst tauscht man einen verschwiegenen Ausfall gegen
+einen erfundenen.
+
+Stanza im Backend: `health_probe: {tool: watcher_health, interval: 900,
+expect: {min_items: 0}}`. Mit der Hysterese (2) meldet sich ein Befund nach
+rund 30 Minuten.
+
 ### Die freie Diagnose am USB-Knoten
 
 `usb.py` liest über `ioreg` die Registratur des Kernels. Das öffnet das Gerät

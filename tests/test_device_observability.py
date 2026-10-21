@@ -69,6 +69,68 @@ class TestSensorFailureIsLoud:
         assert s.scan_button is True
         assert s.ready is True
 
+    async def test_TEILMENGE_ohne_scan_wirft(self, monkeypatch):
+        """🛑 Im Review zu #9 gefunden: der gefährlichste Fall war nicht die
+        leere, sondern die HALBE Antwort.
+
+        Status 0, die Regex trifft einige `[hardware]`-Zeilen, aber nicht
+        `scan`. Dann war `raw` nicht leer, es gab keinen Wurf, `ready` las
+        `True`, `device_readable` las `True` — und `yes("scan")` meldete für
+        immer die Vorgabe „no". Knopf tot, Probe grün, keine Zeile. Genau der
+        Ausfall, der neun Tage gekostet hat, nur durch eine engere Tür.
+        """
+        async def fake_run(*args, timeout=0.0):
+            return 0, (
+                "  --cover-open[=(yes|no)] [no] [hardware]\n"
+                "  --power-save[=(yes|no)] [no] [hardware]\n"
+            )
+
+        monkeypatch.setattr(sane, "_run", fake_run)
+        with pytest.raises(sane.ScannerError) as exc:
+            await sane.read_sensors("fujitsu:test")
+        # Die Meldung muss BEIDE fehlenden Felder nennen, sonst sucht man am
+        # falschen Ende.
+        assert "scan" in str(exc.value)
+        assert "page-loaded" in str(exc.value)
+        # Und sagen, was ANKAM — sonst ist nicht unterscheidbar, ob gar nichts
+        # oder das Falsche gelesen wurde.
+        assert "cover-open" in str(exc.value)
+
+    async def test_TEILMENGE_ohne_page_loaded_wirft(self, monkeypatch):
+        """`page-loaded` fehlt → der Takt bleibt bei 1,0 s statt 0,2 s, und der
+        ~200-ms-Impuls des Knopfes geht verloren. Eigener Test, weil die beiden
+        Felder aus verschiedenen Gründen nötig sind."""
+        async def fake_run(*args, timeout=0.0):
+            return 0, (
+                "  --scan[=(yes|no)] [no] [hardware]\n"
+                "  --cover-open[=(yes|no)] [no] [hardware]\n"
+            )
+
+        monkeypatch.setattr(sane, "_run", fake_run)
+        with pytest.raises(sane.ScannerError, match="page-loaded"):
+            await sane.read_sensors("fujitsu:test")
+
+    async def test_NEGATIVKONTROLLE_vollstaendige_antwort_wirft_nicht(self, monkeypatch):
+        """Ohne sie bestünden die beiden Tests oben auch dann, wenn
+        `read_sensors` IMMER wirft — und der Riegel wäre eine Mauer."""
+        async def fake_run(*args, timeout=0.0):
+            return 0, (
+                "  --scan[=(yes|no)] [yes] [hardware]\n"
+                "  --page-loaded[=(yes|no)] [yes] [hardware]\n"
+            )
+
+        monkeypatch.setattr(sane, "_run", fake_run)
+        s = await sane.read_sensors("fujitsu:test")
+        assert s.scan_button is True
+        assert s.page_loaded is True
+        assert s.ready is True
+
+    def test_die_pflichtfelder_sind_die_vom_WAECHTER_gelesenen(self):
+        """Strukturtest: die Liste darf nicht aus der Luft kommen. Beide
+        Pflichtfelder müssen die sein, von denen das Verhalten des Wächters
+        abhängt — `scan` für den Druck, `page-loaded` für den Takt."""
+        assert set(sane.REQUIRED_SENSORS) == {"scan", "page-loaded"}
+
     def test_leere_sensoren_sind_nicht_bereit(self):
         """Der Riegel an `ready` deckt jede andere Herkunft eines Satzes ab.
 
@@ -273,7 +335,8 @@ class TestProbesAreSerialised:
             verlauf.append("auf")
             await asyncio.sleep(0.01)
             verlauf.append("zu")
-            return 0, "  --scan[=(yes|no)] [no] [hardware]\n"
+            return 0, ("  --scan[=(yes|no)] [no] [hardware]\n"
+                      "  --page-loaded[=(yes|no)] [no] [hardware]\n")
 
         monkeypatch.setattr(sane, "_run", fake_run)
         await asyncio.gather(
@@ -294,7 +357,8 @@ class TestProbesAreSerialised:
             verlauf.append("auf")
             await asyncio.sleep(0.01)
             verlauf.append("zu")
-            return 0, "  --scan[=(yes|no)] [no] [hardware]\n"
+            return 0, ("  --scan[=(yes|no)] [no] [hardware]\n"
+                      "  --page-loaded[=(yes|no)] [no] [hardware]\n")
 
         monkeypatch.setattr(sane, "_run", fake_run)
         # Dasselbe OHNE `_probe` — direkt gegen `_run`.
@@ -311,7 +375,8 @@ class TestProbesAreSerialised:
         aussehen — sonst ist die Messwoche an dieser Stelle blind."""
         async def langsam(*args, timeout=0.0):
             await asyncio.sleep(0.2)
-            return 0, "  --scan[=(yes|no)] [no] [hardware]\n"
+            return 0, ("  --scan[=(yes|no)] [no] [hardware]\n"
+                      "  --page-loaded[=(yes|no)] [no] [hardware]\n")
 
         monkeypatch.setattr(sane, "_run", langsam)
         halter = asyncio.create_task(sane.read_sensors("fujitsu:test"))
@@ -438,3 +503,47 @@ class TestUsbNodeDiagnosis:
 
 class _Cfg:
     device = ""          # produktiv LEER -> jeder Zugriff sucht
+
+
+class TestBefundCodesHabenEineQuelle:
+    """🛑 Prior learning `two-switches-over-one-status-set-drift` (2026-10-04).
+
+    `watcher_health` leitete den Fehlercode anfangs selbst aus dem Zustand ab
+    und schaltete damit ein zweites Mal über dieselbe Menge. Ein neuer
+    Befund-Zustand wäre still als `watcher_dead` beschriftet worden.
+    """
+
+    def test_jeder_befund_zustand_hat_einen_code(self):
+        assert set(button.WATCHER_FINDING_CODES) == {
+            button.WATCHER_DEAD, button.WATCHER_CRASHLOOP}
+
+    def test_kein_NICHT_befund_zustand_steht_in_der_abbildung(self):
+        """Sonst verspräche die Abbildung einen Alarm, den `finding` nie
+        auslöst."""
+        for zustand in (button.WATCHER_OFF, button.WATCHER_STARTING,
+                        button.WATCHER_ALIVE):
+            assert zustand not in button.WATCHER_FINDING_CODES
+
+    async def test_unbekannter_befund_zustand_ALARMIERT_trotzdem(self):
+        """Der Riegel gegen die Drift selbst: fehlt ein Zustand in der
+        Abbildung, muss es einen unspezifischen ALARM geben — nie ein falsches
+        Etikett und nie Stille."""
+        from renfield_mcp_scanner import tools
+
+        class _Neu:
+            def report(self, *, enabled: bool) -> dict:
+                return {"state": "stuck", "finding": True,
+                        "device_readable": True, "detail": "neuer Zustand",
+                        "last_tick_age_seconds": 1.0, "stale_after_seconds": 370.0,
+                        "since": None, "restarts_total": 0, "restart_streak": 0}
+
+        async def knoten():
+            return None
+
+        class _C:
+            device = ""
+            button_watch = True
+
+        r = await tools.watcher_health(_C(), liveness=_Neu(), scanner_node=knoten)
+        assert r["ok"] is False, "ein unbekannter Befund-Zustand darf nicht durchfallen"
+        assert r["error_code"] == "watcher_finding"
