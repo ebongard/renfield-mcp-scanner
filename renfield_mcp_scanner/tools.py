@@ -5,9 +5,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 
-from . import audit, button, classifier, sane, separator
+from . import audit, button, classifier, sane, separator, usb
 from .config import Config, MissingTokenError
 from .contract import StageAction
 from .pusher import TargetPusher
@@ -68,6 +69,80 @@ async def scanner_status(
         "power_save": s.power_save, "double_feed": s.double_feed,
         "error_code": s.error_code, "button_watcher": verdict,
     }
+
+
+async def watcher_health(
+    config: Config, *,
+    liveness: button.WatcherLiveness | None = None,
+    scanner_node: Callable[[], Awaitable[usb.UsbNode | None]] = usb.scanner_node,
+) -> dict:
+    """Befund für die funktionale Probe — OHNE das Gerät anzufassen.
+
+    🛑 Warum nicht `scanner_status`: das fasst das Gerät an (`find_device` +
+    `read_sensors`) und gibt bei fehlendem Gerät eine FEHLERANTWORT zurück. Ein
+    ausgeschalteter Scanner ist auf einem Arbeitsplatzrechner der Normalfall,
+    eine Probe darauf meldete also dauernd Alarm — genau deshalb hatte der
+    Scanner bis 2026-10-21 gar keine Probe, und genau deshalb blieb der blaue
+    Knopf neun Tage tot, ohne dass etwas es sagte.
+
+    Dieses Werkzeug liest nur Dinge, die nichts kosten: die Zeitmarke des
+    Wächters (im Speicher) und den USB-Knoten über `ioreg` (die Registratur des
+    Kernels, öffnet das Gerät NICHT). Es kann den Scanner damit nicht
+    verklemmen — nach dem 2026-10-21 keine Nebensache: dort war das Gerät neun
+    Tage am Bus angemeldet und für SANE trotzdem unansprechbar, ohne dass eine
+    einzige Gerätesuche gelaufen war.
+
+    Die Entscheidung, Zeile für Zeile:
+
+    ======================  ===============  ========  =======================
+    Wächter                 `device_readable`  Knoten   Ergebnis
+    ======================  ===============  ========  =======================
+    `off` (absichtlich)     —                —         ok
+    `starting`              —                —         ok
+    `dead` / `crashloop`    —                —         **Befund**
+    `alive`                 `False`          FEHLT     ok (Scanner aus)
+    `alive`                 `False`          da        **Befund** (verklemmt)
+    `alive`                 `False`          unbekannt ok (keine Auskunft)
+    `alive`                 `True`/`None`    —         ok
+    ======================  ===============  ========  =======================
+
+    🛑 Die letzte Zeile ist die wichtige: liefert `ioreg` keine Auskunft (kein
+    macOS, Zeitablauf, unlesbare Ausgabe), wird daraus KEIN Befund. Eine
+    fehlende Messung darf nicht als Fehler gelesen werden — sonst tauscht man
+    einen verschwiegenen Ausfall gegen einen erfundenen.
+    """
+    verdict = (liveness or button.LIVENESS).report(enabled=config.button_watch)
+    node = None
+    try:
+        node = await scanner_node()
+    except Exception as exc:  # noqa: BLE001 — Diagnose, nie tragend
+        logger.debug("USB-Knoten nicht auswertbar: %s", exc)
+    knoten = None if node is None else {
+        "present": node.present,
+        "session_id": node.session_id,
+        "location_id": node.location_id,
+    }
+    nutzlast = {"button_watcher": verdict, "usb_node": knoten}
+
+    if verdict["finding"]:
+        code = ("watcher_crashloop" if verdict["state"] == button.WATCHER_CRASHLOOP
+                else "watcher_dead")
+        return {**_err(verdict["detail"], code), **nutzlast}
+
+    if (verdict["state"] == button.WATCHER_ALIVE
+            and verdict["device_readable"] is False
+            and node is not None and node.present):
+        return {
+            **_err(
+                "Der Wächter lebt, der USB-Knoten ist vorhanden, aber das Gerät "
+                "ist für SANE nicht ansprechbar — es ist verklemmt. Bekannter "
+                "Rückweg: Scanner aus- und einschalten.",
+                "device_wedged",
+            ),
+            **nutzlast,
+        }
+
+    return {"ok": True, **nutzlast}
 
 
 async def _deliver(

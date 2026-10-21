@@ -80,6 +80,24 @@ async def scanner_status() -> dict:
 
 
 @mcp.tool()
+async def watcher_health() -> dict:
+    """Diagnostic: is the hardware button actually working? Does NOT touch the
+    scanner.
+
+    Reads only free things — the watcher's own timestamp and the USB registry —
+    and reports an error ONLY for a real fault: the watcher is not running, or
+    the scanner is enumerated on USB yet unreachable for SANE (wedged; power-cycle
+    it). A scanner that is simply switched off is a NORMAL state and reports ok.
+
+    This exists for the backend's functional health probe. Prefer
+    `scanner_status` when the user asks whether the scanner is ready — that one
+    reads the real sensors.
+    """
+    config, _ = _ctx()
+    return await t.watcher_health(config)
+
+
+@mcp.tool()
 async def scan_document(ctx: Context, target: str = "", title: str = "") -> dict:
     """START scanning every sheet in the document feeder into one searchable PDF
     and filing it into a single Renfield instance.
