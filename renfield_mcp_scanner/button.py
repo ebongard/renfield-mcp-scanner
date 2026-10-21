@@ -333,6 +333,10 @@ async def watch_button(
     # Freie Diagnose am USB-Knoten: liest die Registratur des Kernels, fasst
     # das Gerät nicht an. Einspritzbar, damit Tests kein `ioreg` aufrufen.
     scanner_node: Callable[[], Awaitable[usb.UsbNode | None]] = usb.scanner_node,
+    # „Läuft gerade ein Scan?" — eingespritzt, damit der Wächter das Gerät
+    # nicht abfragt, während der Scan es hält. Vorgabe: nein (Tests, und ein
+    # Wächter ohne Auftragsverwaltung verhält sich wie bisher).
+    scan_in_flight: Callable[[], bool] = lambda: False,
     sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
     liveness: WatcherLiveness | None = None,
     max_iterations: int | None = None,
@@ -371,6 +375,22 @@ async def watch_button(
 
     while max_iterations is None or iterations < max_iterations:
         iterations += 1
+        if scan_in_flight():
+            # 🛑 Der Scan hält den Einzug — ein Sensorabruf daneben MUSS
+            # scheitern. Am 2026-10-21 gemessen: 4 Fehlschläge über 31 s, und
+            # nach dreien löste der Fehlerpfad eine 6-Sekunden-Vollsuche aus,
+            # mitten im laufenden Scan. Last auf genau dem Anschluss, um den es
+            # geht — und `watcher_health` las den Zusammenstoß als „verklemmt".
+            #
+            # 🛑 Die Marke wird TROTZDEM gesetzt: ein übersprungener Takt ist
+            # ein VOLLENDETER Durchlauf. Ohne sie liefe ein langer Scan (bis
+            # 1800 s) über `LIVENESS_STALE_AFTER` (370 s) und die Aufsicht
+            # erklärte den Knopf für tot — derselbe Fehlalarm, den das
+            # Nicht-Sperren von `scan_batch` gerade vermeiden soll.
+            pressed_before = False
+            leben.tick()
+            await sleep(IDLE_INTERVAL)
+            continue
         try:
             if device is None:
                 device = await find_device(config.device)
@@ -484,6 +504,7 @@ async def supervise_button(
     clock: Callable[[], float] = time.monotonic,
     liveness: WatcherLiveness | None = None,
     max_restarts: int | None = None,
+    scan_in_flight: Callable[[], bool] = lambda: False,
 ) -> None:
     """Hält den Knopfwächter am Leben — und macht sein Ende HÖRBAR.
 
@@ -538,7 +559,7 @@ async def supervise_button(
     while True:
         begonnen = clock()
         try:
-            await run(config, start_job)
+            await run(config, start_job, scan_in_flight=scan_in_flight)
         except Exception:
             # Die Wartezeit soll die AKTUELLE Unruhe abbilden, nicht die
             # Lebensgeschichte des Dienstes. Hat der Wächter vor dem Absturz

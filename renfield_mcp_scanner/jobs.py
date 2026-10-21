@@ -39,6 +39,7 @@ from .contract import (
     INGEST_DISABLED_REASON,
     JOB_EVENT_CONTRACT_HEADER,
     JOB_EVENT_PATH,
+    NO_RECIPIENT_REASON,
     SCANNER_JOB_EVENT_CONTRACT_VERSION,
 )
 
@@ -105,6 +106,15 @@ def public_view(job: dict) -> dict:
     """What leaves this host about a job — the status answer and the completion
     event share it, so the two cannot drift apart."""
     return {"job_id": job["job_id"], "status": job["status"],
+            # 🛑 `caller` MUSS mit. Ohne ihn kann die Gegenseite einen
+            # Knopf-Scan nicht von einem Chat-Scan unterscheiden — und genau
+            # daran hing am 2026-10-21 eine endlose Wiederholung: das Backend
+            # bindet eine Fertigmeldung an die `session_id` des Chats, der den
+            # Scan angefordert hat. Ein Knopfdruck hat keine Sitzung, also
+            # entsteht dort NIE ein Eintrag, und die 409 „unknown job" ist für
+            # ihn endgültig — während sie für einen Chat-Scan zu Recht
+            # wiederholbar ist (der Eintrag kann noch kommen).
+            "caller": job.get("caller") or "",
             "title": job.get("title") or "", "started_at": job.get("started_at"),
             "finished_at": job.get("finished_at"), "result": job.get("result") or {}}
 
@@ -113,6 +123,21 @@ def _equal_jitter(delay: float) -> float:
     """Somewhere in the upper half of the delay. After an outage every open event
     would otherwise retry in lockstep and hit the recovering instance together."""
     return random.uniform(delay / 2, delay)
+
+
+def _no_recipient(resp: httpx.Response) -> bool:
+    """Trägt diese 409 das Merkmal „dieser Auftrag bekommt nie einen Empfänger"?
+
+    🛑 Nur MIT Merkmal ist eine 409 endgültig. Eine blanke 409 heißt „noch
+    nicht notiert, versuch es nochmal" und muss wiederholbar bleiben.
+    """
+    if resp.status_code != 409:
+        return False
+    try:
+        detail = resp.json().get("detail")
+    except Exception:  # noqa: BLE001 — eine unlesbare Antwort ist kein Merkmal
+        return False
+    return isinstance(detail, dict) and detail.get("reason") == NO_RECIPIENT_REASON
 
 
 def _ingest_is_switched_off(resp: httpx.Response) -> bool:
@@ -339,6 +364,17 @@ class JobEventNotifier:
             logger.error("job %s: event rejected with HTTP %s — not retrying",
                          job["job_id"], resp.status_code)
             return EVENT_FATAL, None, ""
+        if _no_recipient(resp):
+            # 🛑 Endgültig, obwohl 409. Die Gegenseite bindet eine
+            # Fertigmeldung an die Sitzung des anfordernden Chats; ein
+            # Knopf-Scan hat keine, also entsteht dort nie ein Eintrag. Am
+            # 2026-10-21 lief der Dienst deshalb gegen eine Ablehnung an, die
+            # sich nicht ändern konnte. Das DOKUMENT ist davon unberührt — es
+            # geht über den getrennten Ingest-Weg und war längst abgelegt.
+            logger.info("job %s: keine Meldeadresse für Auslöser %r (%s) — "
+                        "Dokument ist abgelegt, Meldung entfällt",
+                        job["job_id"], job.get("caller") or "", NO_RECIPIENT_REASON)
+            return EVENT_FATAL, None, ""
         if resp.status_code == 404:
             # 🛑 NUR mit dem Merkmal der Anwendung endgültig. Dieselbe Zahl
             # kommt vom Ingress, wenn gerade kein Pod bereit ist — dann ist sie
@@ -500,6 +536,21 @@ class JobManager:
         task = asyncio.ensure_future(coro)
         self._tasks.add(task)
         task.add_done_callback(self._tasks.discard)
+
+    @property
+    def scan_in_flight(self) -> bool:
+        """Läuft gerade ein Scan? DIE eine Quelle für diese Frage.
+
+        🛑 Zwei Stellen brauchen sie, und sie dürfen nicht auseinanderlaufen:
+        der Knopfwächter (er muss den Sensorabruf überspringen) und
+        `watcher_health` (es darf den Zusammenstoß nicht „verklemmt" nennen).
+        Am 2026-10-21 gemessen: während eines Knopf-Scans scheiterte der
+        Sensorabruf 4× über 31 s mit „open of device failed" — der Scan hält
+        den Einzug, das ist der NORMALFALL. Ohne diese Abfrage meldete die
+        Probe dafür `device_wedged`, und der Fehlerpfad löste nach drei
+        Fehlschlägen noch eine 6-Sekunden-Vollsuche aus, mitten im Scan.
+        """
+        return self._active is not None
 
     async def start(self, *, caller: str | None, target: str, title: str) -> dict:
         async with self._lock:

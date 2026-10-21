@@ -180,7 +180,7 @@ class TestDieAufsichtHaeltDenWaechterAmLeben:
     async def test_ein_absturz_startet_die_schleife_neu(self):
         laeufe = 0
 
-        async def crashing(_config, _start_job):
+        async def crashing(_config, _start_job, **_kw):
             nonlocal laeufe
             laeufe += 1
             raise RuntimeError("unvorhergesehen")
@@ -202,7 +202,7 @@ class TestDieAufsichtHaeltDenWaechterAmLeben:
         """Ohne Deckel würde ein langer Absturzkreis beliebig träge; mit Deckel
         bleibt es bei einer Zeile je Minute — derselbe Takt wie im
         Sensorfehlerpfad."""
-        async def crashing(_config, _start_job):
+        async def crashing(_config, _start_job, **_kw):
             raise RuntimeError("dauerhaft")
 
         schlaf: list[float] = []
@@ -227,7 +227,7 @@ class TestDieAufsichtHaeltDenWaechterAmLeben:
         """
         laeufe = 0
 
-        async def healthy(_config, _start_job):
+        async def healthy(_config, _start_job, **_kw):
             nonlocal laeufe
             laeufe += 1
             return None          # wie `watch_button` mit max_iterations
@@ -261,7 +261,7 @@ class TestDieAufsichtHaeltDenWaechterAmLeben:
         gleichzeitig = 0
         hoechststand = 0
 
-        async def crashing(_config, _start_job):
+        async def crashing(_config, _start_job, **_kw):
             nonlocal gleichzeitig, hoechststand
             gleichzeitig += 1
             hoechststand = max(hoechststand, gleichzeitig)
@@ -286,7 +286,7 @@ class TestDieAufsichtHaeltDenWaechterAmLeben:
         Fängt die Aufsicht sie, hängt der Dienst beim Beenden."""
         import asyncio as _asyncio
 
-        async def cancelled(_config, _start_job):
+        async def cancelled(_config, _start_job, **_kw):
             raise _asyncio.CancelledError()
 
         with pytest.raises(_asyncio.CancelledError):
@@ -311,7 +311,7 @@ class TestDieAufsichtHaeltDenWaechterAmLeben:
         # je Lauf abgefragt (Start und Absturz) und wiederholt die letzte Dauer.
         uhr = _Uhr([1.0, 1.0, button.RESTART_BACKOFF_MAX + 1, 1.0])
 
-        async def crashing(_config, _start_job):
+        async def crashing(_config, _start_job, **_kw):
             raise RuntimeError("weg")
 
         schlaf: list[float] = []
@@ -338,7 +338,7 @@ class TestDieAufsichtHaeltDenWaechterAmLeben:
         ab, darf der Zähler NICHT zurückgesetzt werden — sonst hämmert ein
         Absturzkreis dauerhaft im 5-Sekunden-Takt und flutet das Protokoll.
         """
-        async def crashing(_config, _start_job):
+        async def crashing(_config, _start_job, **_kw):
             raise RuntimeError("dauerhaft")
 
         schlaf: list[float] = []
@@ -390,7 +390,7 @@ class TestDieAufsichtUmgehtDieSelbstbremseNICHT:
     """
 
     async def test_die_wartezeit_unterbietet_die_suchbremse_nie(self):
-        async def crashing(_config, _start_job):
+        async def crashing(_config, _start_job, **_kw):
             raise RuntimeError("dauerhaft")
 
         schlaf: list[float] = []
@@ -562,7 +562,7 @@ class TestDerWaechterbefundHaengtAnEinerZEITMARKE:
         Lauf neu beginnt und die Summe sonst untertreibt."""
         leben = button.WatcherLiveness()
 
-        async def crashing(_config, _start_job):
+        async def crashing(_config, _start_job, **_kw):
             raise RuntimeError("dauerhaft")
 
         async def sleep(_s):
@@ -686,7 +686,7 @@ class TestEinAbsturzkreisIstKeinLEBEN:
         Marke allein kann das nicht ausdrücken."""
         leben = button.WatcherLiveness()
 
-        async def crashing(_config, _start_job):
+        async def crashing(_config, _start_job, **_kw):
             leben.tick()                 # ein vollendeter Durchlauf …
             raise RuntimeError("weg")    # … und dann der Absturz
 

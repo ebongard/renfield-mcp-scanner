@@ -75,6 +75,7 @@ async def watcher_health(
     config: Config, *,
     liveness: button.WatcherLiveness | None = None,
     scanner_node: Callable[[], Awaitable[usb.UsbNode | None]] = usb.scanner_node,
+    scan_in_flight: Callable[[], bool] = lambda: False,
 ) -> dict:
     """Befund für die funktionale Probe — OHNE das Gerät anzufassen.
 
@@ -133,6 +134,15 @@ async def watcher_health(
         # verschwiegener Befund.
         code = button.WATCHER_FINDING_CODES.get(verdict["state"], "watcher_finding")
         return {**_err(verdict["detail"], code), **nutzlast}
+
+    if scan_in_flight():
+        # 🛑 Der häufigste Grund für „Gerät nicht lesbar" ist kein Defekt,
+        # sondern ein laufender Scan: er hält den Einzug, und der Sensorabruf
+        # daneben MUSS scheitern. Am 2026-10-21 gemessen — 4 Fehlschläge über
+        # 31 s eines Knopf-Scans. Ohne diese Zeile meldet die Probe dafür
+        # `device_wedged`, also einen Fehlalarm auf den normalsten Zustand
+        # überhaupt. Eine Probe, die am Normalfall anschlägt, wird abgeschaltet.
+        return {"ok": True, "scan_in_flight": True, **nutzlast}
 
     if (verdict["state"] == button.WATCHER_ALIVE
             and verdict["device_readable"] is False

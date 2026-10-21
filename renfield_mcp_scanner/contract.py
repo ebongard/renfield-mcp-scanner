@@ -64,6 +64,21 @@ JOB_EVENT_PATH = "/api/scanner/job-event"
 #: ausgerollt ist — Lärm ohne Erkenntnis.
 INGEST_DISABLED_REASON = "folder_ingest_disabled"
 
+#: Merkmal einer 409, die ENDGÜLTIG ist: die Gegenseite wird für diesen
+#: Auftrag nie einen Empfänger haben.
+#:
+#: 🛑 Eine blanke 409 „unknown job" ist mit Absicht WIEDERHOLBAR — ein Scan,
+#: der sofort scheitert, kann melden, bevor die Gegenseite den Anforderer
+#: notiert hat. Für einen KNOPF-Scan gilt das nie: das Backend bindet die
+#: Fertigmeldung an die `session_id` des anfordernden Chats, und ein
+#: Knopfdruck hat keine Sitzung. Am 2026-10-21 wiederholte der Dienst deshalb
+#: gegen eine Ablehnung, die sich nie ändern konnte.
+#:
+#: Dasselbe Muster wie bei der 404: endgültig ist eine Ablehnung nur MIT
+#: Merkmal. Ohne Merkmal bleibt sie wiederholbar — die Unterscheidung gehört
+#: der Anwendung, nicht dem Statuscode.
+NO_RECIPIENT_REASON = "no_recipient_for_caller"
+
 
 class IngestStatus(str, Enum):
     """The backend's 4-state reply. All four arrive as HTTP 200."""
