@@ -34,11 +34,20 @@ class _Fake:
         self.sleeps: list[float] = []
         self.jobs: list[dict] = []
         self.reads = 0
+        self.finds = 0
+        self.node_calls = 0
         self.result: dict = {"job_id": "j1"}
         self.raise_on: set[int] = set()
 
     async def find_device(self, _hint):
+        self.finds += 1
         return "fujitsu:test"
+
+    async def scanner_node(self):
+        # 🛑 Eingespritzt, damit kein Test `ioreg` aufruft. Ein Test, der die
+        # Umgebung befragt, prüft nicht den Code, sondern den Rechner.
+        self.node_calls += 1
+        return None
 
     async def read_sensors(self, _device):
         i = self.reads
@@ -57,7 +66,7 @@ class _Fake:
     async def run(self, iterations):
         await button.watch_button(
             _Config(), self.start_job,
-            read_sensors=self.read_sensors, find_device=self.find_device,
+            read_sensors=self.read_sensors, find_device=self.find_device, scanner_node=self.scanner_node,
             sleep=self.sleep, max_iterations=iterations,
         )
 
@@ -147,7 +156,7 @@ class TestSurvival:
         f = _Fake([_sensors(pressed=True, paper=True), _sensors(paper=True)])
         await button.watch_button(
             _Config(), boom, read_sensors=f.read_sensors,
-            find_device=f.find_device, sleep=f.sleep, max_iterations=2,
+            find_device=f.find_device, scanner_node=f.scanner_node, sleep=f.sleep, max_iterations=2,
         )
         assert len(f.sleeps) == 2   # lief weiter
 
@@ -482,7 +491,7 @@ class TestDerWaechterbefundHaengtAnEinerZEITMARKE:
         f.raise_on = {0, 1, 2, 3, 4}          # das Gerät antwortet NIE
         await button.watch_button(
             _Config(), f.start_job, read_sensors=f.read_sensors,
-            find_device=f.find_device, sleep=f.sleep, liveness=leben,
+            find_device=f.find_device, scanner_node=f.scanner_node, sleep=f.sleep, liveness=leben,
             max_iterations=5,
         )
         befund = leben.report(enabled=True)
@@ -506,7 +515,7 @@ class TestDerWaechterbefundHaengtAnEinerZEITMARKE:
         f = _Fake([_sensors(paper=False)] * 3)
         await button.watch_button(
             _Config(), f.start_job, read_sensors=f.read_sensors,
-            find_device=f.find_device, sleep=f.sleep, liveness=leben,
+            find_device=f.find_device, scanner_node=f.scanner_node, sleep=f.sleep, liveness=leben,
             max_iterations=3,
         )
         befund = leben.report(enabled=True)
@@ -663,7 +672,7 @@ class TestEinAbsturzkreisIstKeinLEBEN:
         with pytest.raises(AttributeError):
             await button.watch_button(
                 _Config(), start_job, read_sensors=f.read_sensors,
-                find_device=f.find_device, sleep=f.sleep, liveness=leben,
+                find_device=f.find_device, scanner_node=f.scanner_node, sleep=f.sleep, liveness=leben,
                 max_iterations=1,
             )
 
