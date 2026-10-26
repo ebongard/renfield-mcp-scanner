@@ -424,10 +424,21 @@ gefunden.
 Seit #11 tragen beide Aufrufe eine abgeleitete Zeitgrenze (`60 s +
 20 s/Seite`, s. „Das Zeitbudget des Zusammenbaus"), unbegrenzt ist dort also
 nichts mehr. **Die Wahl bleibt trotzdem richtig, und zwar deutlicher als
-vorher:** ein voller Einzug ergibt duplex 100 Seiten und damit ein Budget von
-rund 34 Minuten — das Fünffache von `LIVENESS_STALE_AFTER` (370 s). Eine
-Grenze, die weit jenseits des Lebendigkeitsfensters liegt, taugt nicht als
-Lebendigkeitsgrenze. Die Phase ist die Quelle, nicht der Auftrag.
+vorher.** Das Budget gilt je UNTERPROZESS, der Ausfall aber je AUFTRAG, und
+dazwischen liegt ein Faktor vier: ein voller Einzug ergibt duplex 100 Seiten
+→ `B` = 2060 s; ein `assemble` zahlt es zweimal (`img2pdf`, dann `ocrmypdf`)
+→ 2·B; und der Klassifizierer-Pfad ruft `assemble` zweimal auf (einmal für
+die Sonden-PDF, einmal in `_deliver`) → **4·B ≈ 2 h 17 min**, das
+22-Fache von `LIVENESS_STALE_AFTER` (370 s). Dazu kommt `correct_file`, das
+weiterhin unbegrenzt je Seite läuft.
+
+Eine Grenze, die zwanzigfach jenseits des Lebendigkeitsfensters liegt, taugt
+nicht als Lebendigkeitsgrenze. Die Phase ist die Quelle, nicht der Auftrag —
+und diese Zahl ist der Grund, warum das so bleiben muss. Offen und als Befund
+notiert: der doppelte `assemble` ist unnötige Arbeit (die OCR läuft zweimal
+über denselben Stapel) und zugleich der Grund für die Vervierfachung; ein
+Budget je Auftrag statt je Aufruf gehört dazu. Beides im Review zu #11
+gefunden (B2/B3).
 
 Das Gerät wird nur während `scan_batch` gehalten, und das ist durch sein
 eigenes `timeout=1800` begrenzt. **Unbegrenztes Schweigen ist damit
