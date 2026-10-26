@@ -168,6 +168,71 @@ Requires `zbar` (`brew install zbar`) and the `barcode` extra.
 
 ## Der blaue Knopf
 
+🛑 **AUS als Vorgabe seit 2026-10-26 (`SCANNER_BUTTON_WATCH`), weil er den
+Scanner festsetzt.** Auf dem ScanSnap S1500 schließen sich „Knopf jederzeit"
+und „verklemmt nie" gegenseitig aus. Drei Messungen, die zusammen keinen
+Ausweg lassen:
+
+| Messung | Folge |
+|---|---|
+| Der Impuls dauert 200–250 ms und **hält nicht** | Takt ≤ 200 ms, sonst gehen Drücke verloren |
+| Jede Abfrage ist ein `scanimage -d … -A`, also ein voller Öffnungsvorgang | der Takt ist Gerätelast, nicht Prozessorlast |
+| Die IORegistry trägt **keine** Knopf-Eigenschaft (2026-10-26 nachgesehen) | kein freies Signal, das das Öffnen ersetzen könnte |
+
+Dazu eine Messung gegen die bequeme Erklärung: im verklemmten Zustand steht
+`CurrentPowerState == MaxPowerState` (`ioreg`, 2026-10-26). Das schließt
+**USB-Suspend** aus — der Bus hält das Gerät bei voller Leistung, es ist also
+nicht der Rechner, der es schlafen legt. ⚠️ Ein **geräteinternes** Standby
+schließt es NICHT aus; dafür gäbe es `Sensors.power_save` aus `sane.py`, und
+das ist im verklemmten Zustand nicht abfragbar — jede Abfrage bräuchte genau
+die Öffnung, die scheitert. Die Auto-Abschaltung ist damit unwahrscheinlich
+gemacht, nicht widerlegt.
+
+Verschärfend, lange übersehen: der Takt hängt an `sensors.page_loaded`
+(`button.py:493`), mit der Begründung „ohne Papier kann der Knopf ohnehin
+nichts auslösen". Der Entwurf nahm an, Papier liege nur kurz vor einem Scan
+ein. Wer den Deckel offen und Papier dauerhaft eingelegt lässt — der
+Normalfall beim Eigentümer — bekommt nach dem Code **fünf Öffnungen je
+Sekunde** statt einer. ⚠️ Gefolgert, nicht gemessen: die Episoden, auf die
+sich die Zahlen unten stützen, liefen ausdrücklich „NUR `read_sensors`
+(~1/s)", also ohne Papier im Einzug.
+
+⚠️ **Die DOSIS ist nicht belegt, und zwei Messungen widersprechen sich.** Zehn
+Abfragen je Sekunde setzten das Gerät nach rund einer halben Stunde fest
+(≈ 18.000 Öffnungen); eine Abfrage je Sekunde nach rund 14 Minuten. Letzteres
+ist am Protokoll nachgemessen (2026-10-26): **fünf Episoden im Band
+842–872 s**, Mittel ≈ 863 s, Streuung ≈ 11 s — alle am 2026-10-21.
+
+Das ist in die FALSCHE Richtung: ein reiner Öffnungszähler müsste bei höherem
+Takt FRÜHER klemmen. Und die enge Streuung über fünf Läufe passt ebenso gut zu
+einem **Uhrwerk** (fester Zeitgeber um 14,5 min) wie zu einer Dosis bei
+konstantem Takt — alle fünf stammen vom selben Tag, also vermutlich vom selben
+Takt. **Diese Zahl unterscheidet die beiden Erklärungen nicht.**
+
+🛑 **Dass das Abschalten hilft, ist plausibel und NICHT bewiesen.** Gilt die
+Dosis, hilft es vollständig. Gilt das Uhrwerk, verklemmt das Gerät weiter —
+dann allerdings in einem Zustand, in dem auch ein angeforderter Scan
+scheitert, und das wäre vorher wie nachher so. Der entscheidende Versuch ist
+billig: nach einem Aus/Ein mehr als 15 Minuten nichts tun, dann EINEN Scan
+anfordern. Klappt er, war es die Dosis.
+
+Solange das offen ist, taugt keine Zahl als Grundlage für einen „sicheren"
+Takt — und genau deshalb ist der Wächter aus und nicht langsamer gestellt.
+
+Der Wächter (`server.py:310`) ist die einzige periodische Aufgabe, die das
+Gerät anfasst; alles andere öffnet nur auf Anforderung. **Aus heißt: im
+Ruhezustand null Öffnungen.** Gescannt wird über einen angeforderten Scan
+(Chat, Weboberfläche, `scan_document`). `watcher_health` meldet dann
+`state: "off"` mit `finding: false` — kein Daueralarm, die Abschaltung ist
+eine Entscheidung und wird als solche gemeldet.
+
+`SCANNER_BUTTON_WATCH=true` schaltet ihn wieder an: für Geräte, deren Sensor
+den Druck hält, oder um die Dosis sauber auszumessen. Auf diesem Modell
+verklemmt er dann wieder.
+
+Alles Folgende beschreibt, wie der Wächter arbeitet, WENN er eingeschaltet
+ist — die Maschinerie bleibt vollständig erhalten.
+
 Ein Druck am Gerät startet einen Scan — dieselbe Strecke wie `scan_document`,
 nur ohne Agenten. Ein Hardwareknopf sendet kein Ereignis, also wird der
 SANE-Sensor gepollt; das ist die einzige verfügbare Bauform, nicht Bequemlichkeit.
@@ -186,7 +251,7 @@ beide Grenzen fest.
 Ein Knopfdruck trägt keine Absicht: das Ziel bestimmt der Klassifizierer, und
 ein Trennblatt sticht ihn aus. Die FERTIGMELDUNG braucht dagegen eine feste
 Adresse — ohne `SCANNER_CALLER_TARGET_BUTTON` läuft der Scan durch, aber niemand
-erfährt davon. Abschaltbar mit `SCANNER_BUTTON_WATCH=false`.
+erfährt davon. Der Schalter ist `SCANNER_BUTTON_WATCH` (Vorgabe: aus, s. oben).
 
 🛑 **Der Wächter läuft unter Aufsicht, und sein Ende ist hörbar.** Bis zum
 2026-10-11 lief er als nackte Task: `watch_button` fängt alles Vorgesehene ab

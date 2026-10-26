@@ -97,11 +97,32 @@ class Config(BaseModel):
     push_timeout_seconds: float = 120.0
     max_concurrent_pushes: int = 4
     health_poll_seconds: int = 60
-    # Der blaue Knopf am Gerät startet einen Scan. AN by default: ohne ihn
-    # ist der Scanner nur über einen Agenten bedienbar, und genau das war
-    # die Lücke (2026-09-25). `SCANNER_BUTTON_WATCH=false` schaltet ihn ab,
-    # etwa auf einem Host ohne angeschlossenes Gerät.
-    button_watch: bool = True
+    # Der blaue Knopf am Gerät startet einen Scan. 🛑 AUS als Vorgabe, und das
+    # ist eine MESSUNG, keine Meinung: auf dem ScanSnap S1500 schliessen sich
+    # „Knopf jederzeit" und „verklemmt nie" gegenseitig aus.
+    #
+    #   * Der Knopfimpuls dauert 200–250 ms und HAELT NICHT (gemessen, s.
+    #     Modulkopf von `button.py`). Wer ihn fangen will, muss mindestens
+    #     fuenfmal je Sekunde fragen.
+    #   * Jede Frage ist ein `scanimage -d … -A`, also ein voller
+    #     Geraete-Oeffnungsvorgang. Nach einigen hundert davon ist das Geraet
+    #     fuer SANE unansprechbar (`open … failed: Invalid argument`), und nur
+    #     Aus-/Einschalten hilft — belegt null Selbstheilungen.
+    #   * Die IORegistry traegt KEINE Knopf-Eigenschaft (2026-10-26
+    #     nachgesehen), es gibt also kein freies Signal, das das Oeffnen
+    #     ersetzen koennte.
+    #   * Im verklemmten Zustand steht `CurrentPowerState == MaxPowerState`
+    #     (2026-10-26 gemessen): das Geraet SCHLAEFT nicht. Es ist unser
+    #     Abfragen, nicht Stromsparen.
+    #
+    # Der Wächter ist damit die einzige periodische Aufgabe, die das Geraet
+    # anfasst — aus heisst: im Ruhezustand NULL Oeffnungen. Scannen geht ueber
+    # einen angeforderten Scan (Chat, Weboberfläche, `scan_document`).
+    #
+    # `SCANNER_BUTTON_WATCH=true` schaltet ihn wieder an — fuer Geraete, deren
+    # Sensor den Druck haelt, oder um die Dosis sauber auszumessen. Dann
+    # verklemmt dieses Modell wieder.
+    button_watch: bool = False
     # DELIBERATELY stricter than a suggestion would need. simba_classify can sit
     # at a lower bar because it only prefills a picker and a human corrects it;
     # above THIS threshold a document is filed across a trust boundary with
@@ -195,7 +216,28 @@ def _caller_targets(target_ids: set[str]) -> dict[str, str]:
 
 
 def load_config() -> Config:
+    """Konfiguration aus der Umgebung.
+
+    🛑 **Kein Vorgabe-Literal in dieser Funktion.** Die Vorgabe steht genau
+    einmal, am Feld des Modells; `_env` holt sie von dort. Vorher doppelte
+    diese Funktion sie bei 17 von 18 Feldern (`env("SCANNER_RESOLUTION",
+    "300")` gegen `resolution: int = 300`). Zwei Quellen für denselben Wert
+    driften — und die des Modells war die wirkungslose, weil der Dienst seine
+    Konfiguration ausschliesslich hierueber baut. Am 2026-10-26 wurde das
+    teuer: das Umstellen von `button_watch` auf `False` am Modell haette
+    NICHTS getan, solange hier `"true"` stand.
+
+    Wer ein Feld hinzufuegt, schreibt die Vorgabe ans Modell und ruft hier nur
+    `_env("feld", "SCANNER_NAME", cast)`. Ein Strukturtest haelt zu, dass
+    niemand doch wieder ein Literal hinschreibt.
+    """
     env = os.environ.get
+
+    def _env(field: str, name: str, cast=str):
+        """Der Wert aus der Umgebung, sonst die Vorgabe DES MODELLS."""
+        raw = env(name, "").strip()
+        return cast(raw) if raw else _default(field)
+
     targets_yaml = env("SCANNER_TARGETS_YAML", "").strip()
     if not targets_yaml:
         raise ValueError("SCANNER_TARGETS_YAML is required (path to the target registry)")
@@ -204,28 +246,66 @@ def load_config() -> Config:
     caller_targets = _caller_targets({t.id for t in targets})
     return Config(
         targets=targets,
-        staging_dir=Path(env("SCANNER_STAGING_DIR", "~/.renfield-scanner/staging")).expanduser(),
-        device=env("SCANNER_DEVICE", ""),
-        resolution=int(env("SCANNER_RESOLUTION", "300")),
-        mode=env("SCANNER_MODE", DEFAULT_MODE),
-        source=env("SCANNER_SOURCE", DEFAULT_SOURCE),
-        page_height_mm=float(env("SCANNER_PAGE_HEIGHT_MM", "297")),
-        white_clip=float(env("SCANNER_WHITE_CLIP", "0.90")),
-        ocr_languages=env("SCANNER_OCR_LANGUAGES", "deu+eng"),
-        push_timeout_seconds=float(env("SCANNER_PUSH_TIMEOUT_SECONDS", "120")),
-        max_concurrent_pushes=int(env("SCANNER_MAX_CONCURRENT_PUSHES", "4")),
-        health_poll_seconds=int(env("SCANNER_HEALTH_POLL_SECONDS", "60")),
-        route_auto_threshold=float(env("SCANNER_ROUTE_AUTO_THRESHOLD", "0.95")),
-        classifier_url=env("SCANNER_CLASSIFIER_URL", ""),
-        classifier_model=env("SCANNER_CLASSIFIER_MODEL", ""),
-        staging_retention_days=int(env("SCANNER_STAGING_RETENTION_DAYS", "30")),
-        staging_warn_after_days=float(env("SCANNER_PENDING_WARN_DAYS", "1")),
-        mcp_host=env("SCANNER_MCP_HOST", "127.0.0.1"),
-        mcp_port=int(env("SCANNER_MCP_PORT", "9093")),
+        # `staging_dir` ist am Modell PFLICHT (kein Vorgabewert), hat also nur
+        # HIER eine — die einzige Stelle, an der ein Literal richtig ist.
+        staging_dir=Path(env("SCANNER_STAGING_DIR") or "~/.renfield-scanner/staging").expanduser(),
+        device=_env("device", "SCANNER_DEVICE"),
+        resolution=_env("resolution", "SCANNER_RESOLUTION", int),
+        mode=_env("mode", "SCANNER_MODE"),
+        source=_env("source", "SCANNER_SOURCE"),
+        page_height_mm=_env("page_height_mm", "SCANNER_PAGE_HEIGHT_MM", float),
+        white_clip=_env("white_clip", "SCANNER_WHITE_CLIP", float),
+        ocr_languages=_env("ocr_languages", "SCANNER_OCR_LANGUAGES"),
+        push_timeout_seconds=_env("push_timeout_seconds", "SCANNER_PUSH_TIMEOUT_SECONDS", float),
+        max_concurrent_pushes=_env("max_concurrent_pushes", "SCANNER_MAX_CONCURRENT_PUSHES", int),
+        health_poll_seconds=_env("health_poll_seconds", "SCANNER_HEALTH_POLL_SECONDS", int),
+        route_auto_threshold=_env("route_auto_threshold", "SCANNER_ROUTE_AUTO_THRESHOLD", float),
+        classifier_url=_env("classifier_url", "SCANNER_CLASSIFIER_URL"),
+        classifier_model=_env("classifier_model", "SCANNER_CLASSIFIER_MODEL"),
+        staging_retention_days=_env("staging_retention_days", "SCANNER_STAGING_RETENTION_DAYS", int),
+        staging_warn_after_days=_env("staging_warn_after_days", "SCANNER_PENDING_WARN_DAYS", float),
+        mcp_host=_env("mcp_host", "SCANNER_MCP_HOST"),
+        mcp_port=_env("mcp_port", "SCANNER_MCP_PORT", int),
         mcp_tokens=_caller_tokens(),
         caller_targets=caller_targets,
-        job_event_retry_hours=float(env("SCANNER_JOB_EVENT_RETRY_HOURS", "24")),
-        job_event_concurrency=int(env("SCANNER_JOB_EVENT_CONCURRENCY", "2")),
-        button_watch=env("SCANNER_BUTTON_WATCH", "true").strip().lower()
-        not in ("0", "false", "no", "off"),
+        job_event_retry_hours=_env("job_event_retry_hours", "SCANNER_JOB_EVENT_RETRY_HOURS", float),
+        job_event_concurrency=_env("job_event_concurrency", "SCANNER_JOB_EVENT_CONCURRENCY", int),
+        button_watch=_flag("SCANNER_BUTTON_WATCH", _default("button_watch"), env),
     )
+
+
+def _default(field: str):
+    """Die Vorgabe, wie sie im Modell steht — die EINZIGE Quelle."""
+    return Config.model_fields[field].default
+
+
+_JA = ("1", "true", "yes", "on", "ja", "an")
+_NEIN = ("0", "false", "no", "off", "nein", "aus")
+
+
+def _flag(name: str, default: bool, env) -> bool:
+    """Ein Ja/Nein-Schalter aus der Umgebung, mit der Vorgabe des Modells.
+
+    🛑 Eine AUSDRÜCKLICHE Ja-Menge, keine „alles ausser nein". Die erste
+    Fassung las `raw not in ("0","false","no","off")`, also ergaben „nein",
+    „aus", „maybe" und der Tippfehler „flase" ein JA. Solange die Vorgabe AN
+    war, war das harmlos — ein Tippfehler traf dieselbe Entscheidung. Seit der
+    Knopfwächter AUS als Vorgabe ist, dreht ein Tippfehler ihn AN und setzt
+    damit den Scanner fest. Nachsichtigkeit zeigte also in die gefaehrliche
+    Richtung.
+
+    Unbekanntes faellt auf die Vorgabe zurueck, aber LAUT: stillschweigend die
+    sichere Seite zu waehlen verschweigt dem Betreiber, dass seine Einstellung
+    nicht gilt.
+    """
+    raw = env(name, "").strip().lower()
+    if not raw:
+        return default
+    if raw in _JA:
+        return True
+    if raw in _NEIN:
+        return False
+    logger.warning("%s=%r ist weder ja noch nein — es gilt die Vorgabe %r. "
+                   "Erlaubt: %s bzw. %s", name, raw, default,
+                   "/".join(_JA), "/".join(_NEIN))
+    return default

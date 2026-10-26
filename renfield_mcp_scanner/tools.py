@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 
@@ -76,6 +77,7 @@ async def watcher_health(
     liveness: button.WatcherLiveness | None = None,
     scanner_node: Callable[[], Awaitable[usb.UsbNode | None]] = usb.scanner_node,
     device_held: Callable[[], bool] = sane.device_held,
+    letzter_zugriff: Callable[[], dict | None] = sane.last_open,
 ) -> dict:
     """Befund für die funktionale Probe — OHNE das Gerät anzufassen.
 
@@ -153,6 +155,35 @@ async def watcher_health(
                 "ist für SANE nicht ansprechbar — es ist verklemmt. Bekannter "
                 "Rückweg: Scanner aus- und einschalten.",
                 "device_wedged",
+            ),
+            **nutzlast,
+        }
+
+    # 🛑 Ohne Wächter gäbe es sonst GAR KEINE Verklemmungserkennung mehr.
+    # `device_readable` setzt nur der Wächter; ist er aus — seit 2026-10-26 die
+    # Vorgabe —, bleibt es `None` und der Zweig oben kann nie feuern. Das wäre
+    # der Neun-Tage-Ausfall durch eine neue Tür: vom 22. bis 25.10. war das
+    # Gerät praktisch durchgehend verklemmt, 640–669 Fehlzeilen am Tag.
+    #
+    # Der Ersatz kostet keine Öffnung: `sane.last_open()` hält fest, wie der
+    # letzte ANGEFORDERTE Zugriff ausging. Das ist ausdrücklich keine
+    # Live-Aussage, und die Meldung sagt das auch — sonst behauptete eine
+    # Vergangenheitsform eine Gegenwart.
+    letzter = letzter_zugriff()
+    nutzlast["last_device_open"] = letzter
+    if (verdict["state"] != button.WATCHER_ALIVE
+            and letzter is not None and letzter["ok"] is False
+            and node is not None and node.present):
+        alter = max(0.0, time.time() - letzter["at"])
+        return {
+            **_err(
+                "Der USB-Knoten ist vorhanden, aber der letzte Zugriff auf das "
+                f"Gerät schlug fehl (vor {alter / 60:.0f} min): "
+                f"{letzter['detail']}. Das spricht für eine Verklemmung. "
+                "Bekannter Rückweg: Scanner aus- und einschalten. 🛑 Dies ist "
+                "der letzte VERSUCH, keine Live-Messung — der Knopfwächter ist "
+                "aus, es wird im Ruhezustand nichts geöffnet.",
+                "device_wedged_last_attempt",
             ),
             **nutzlast,
         }
