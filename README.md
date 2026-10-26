@@ -415,11 +415,30 @@ Takt, und die Probe meldet `ok`.
 🛑 **Die Quelle ist die PHASE, nicht der Auftrag — und das ist der Unterschied
 zwischen begrenzt und unbegrenzt.** Die erste Fassung fragte
 `JobManager._active`, also „läuft ein Auftrag". Das umfasst Zusammenbau, OCR
-und Klassifizierung, und `img2pdf`/`ocrmypdf` laufen über `asyncio.to_thread`
-**ohne Zeitgrenze und unabbrechbar**. Eine hängende OCR hätte den Auftrag für
-immer „laufend" gehalten: die Probe dauerhaft verstummt, die Zeitmarke grün,
-der Knopf tot — der Neun-Tage-Ausfall durch eine neue Tür. Im Review zu #10
+und Klassifizierung, und `img2pdf`/`ocrmypdf` laufen über `asyncio.to_thread`,
+sind also **unabbrechbar**. Eine hängende OCR hätte den Auftrag für immer
+„laufend" gehalten: die Probe dauerhaft verstummt, die Zeitmarke grün, der
+Knopf tot — der Neun-Tage-Ausfall durch eine neue Tür. Im Review zu #10
 gefunden.
+
+Seit #11 tragen beide Aufrufe eine abgeleitete Zeitgrenze (`60 s +
+20 s/Seite`, s. „Das Zeitbudget des Zusammenbaus"), unbegrenzt ist dort also
+nichts mehr. **Die Wahl bleibt trotzdem richtig, und zwar deutlicher als
+vorher.** Das Budget gilt je UNTERPROZESS, der Ausfall aber je AUFTRAG, und
+dazwischen liegt ein Faktor vier: ein voller Einzug ergibt duplex 100 Seiten
+→ `B` = 2060 s; ein `assemble` zahlt es zweimal (`img2pdf`, dann `ocrmypdf`)
+→ 2·B; und der Klassifizierer-Pfad ruft `assemble` zweimal auf (einmal für
+die Sonden-PDF, einmal in `_deliver`) → **4·B ≈ 2 h 17 min**, das
+22-Fache von `LIVENESS_STALE_AFTER` (370 s). Dazu kommt `correct_file`, das
+weiterhin unbegrenzt je Seite läuft.
+
+Eine Grenze, die zwanzigfach jenseits des Lebendigkeitsfensters liegt, taugt
+nicht als Lebendigkeitsgrenze. Die Phase ist die Quelle, nicht der Auftrag —
+und diese Zahl ist der Grund, warum das so bleiben muss. Offen und als Befund
+notiert: der doppelte `assemble` ist unnötige Arbeit (die OCR läuft zweimal
+über denselben Stapel) und zugleich der Grund für die Vervierfachung; ein
+Budget je Auftrag statt je Aufruf gehört dazu. Beides im Review zu #11
+gefunden (B2/B3).
 
 Das Gerät wird nur während `scan_batch` gehalten, und das ist durch sein
 eigenes `timeout=1800` begrenzt. **Unbegrenztes Schweigen ist damit
@@ -543,6 +562,53 @@ off every A4 page; ocrmypdf's default optimizer transcodes to lossy JPEG; never
 deskew twice; scanner-side `--swdeskew` *creates* skew on sparse back pages;
 raw colour is strongly blue; duplex show-through needs explicit clearing. Each
 carries its measurement in a comment at the point it is handled.
+
+### Das Zeitbudget des Zusammenbaus
+
+`img2pdf` und `ocrmypdf` liefen bis #11 ohne Zeitgrenze. Beide laufen über
+`asyncio.to_thread` und sind unabbrechbar, also hätte ein einziger hängender
+Kindprozess `JobManager._active` für immer gesetzt gelassen: jedes `start()`
+antwortet `busy`, der blaue Knopf ist tot — und `watcher_health` meldet weiter
+`ok`, weil das Gerät längst freigegeben ist. Ein stiller Dauerausfall, der
+aussieht wie ein Gerätedefekt.
+
+Die Grenze ist **gemessen, nicht gewählt** (2026-10-26, auf dem
+Produktions-Mac, mit genau den Produktionsflags, über 2/8/20 Seiten):
+
+| | je Seite | fest |
+|---|---|---|
+| `img2pdf` | ~1,6 s | 1,5 s |
+| `ocrmypdf` | ~1,15 s | 5 s |
+
+Budget: `ASSEMBLY_OVERHEAD + ASSEMBLY_PER_PAGE × Seiten` = **60 s + 20 s/Seite**,
+**12,5× für `img2pdf` und 17× für `ocrmypdf`** — das Budget gilt je
+Unterprozess, nicht über den ganzen Zusammenbau. (Gegen die Summe beider
+Messwerte wären es 7×; das ist die Rechnung für ein Budget je Auftrag, und
+das ist noch nicht gebaut — s. den Befund zum doppelten `assemble`.) Der
+Faktor ist absichtlich großzügig: sie soll ein *unbegrenztes* Warten begrenzen,
+nicht eine langsame Maschine maßregeln — eine dichte Seite oder ein belasteter
+Rechner darf seine Texterkennung nicht verlieren.
+
+🛑 **Nicht `subprocess.run(timeout=...)`.** Das tötet nur das unmittelbare
+Kind, und `ocrmypdf` ist ein Elternteil: ein Lauf hält gemessen sieben
+tesseract-Nachkommen. Im gesunden Fall beenden die ihre Seite und gehen binnen
+~4 s von selbst — aber der Fall, für den das Budget existiert, ist ein
+*hängender* tesseract, und dort überlebt er den Tod des Elternteils unbegrenzt
+und hält einen Kern und das Staging-Verzeichnis. `_run_bounded` gibt dem Kind
+darum mit `start_new_session` eine eigene Prozessgruppe und schickt bei Ablauf
+SIGKILL an die Gruppe. Kehrt die Nachlese danach nicht zurück, hält noch
+jemand die Rohre — das ist eine `ERROR`-Zeile, keine stille Unterdrückung.
+
+`ocrmypdf` ist der einzige Elternteil im Paket; `img2pdf`, `pdftotext` und
+`scanimage` sind Einzelprozesse (die ersten beiden gegengemessen), deshalb
+genügt ihnen das Töten des Kindes.
+
+Die zwei Aufrufe scheitern unterschiedlich schwer, und das bleibt so:
+`img2pdf`-Ablauf ist tödlich (`AssemblyError`) — ohne PDF gibt es nichts
+abzuliefern. `ocrmypdf`-Ablauf ist nur eine weitere Art, auf die die
+Texterkennung nicht zustande kam, und läuft deshalb in den *bestehenden*
+Rückfallpfad: das un-OCRte PDF wird behalten, der Grund protokolliert. **Ein
+Dokument geht nie verloren, weil die Texterkennung scheiterte.**
 
 ## Tests
 

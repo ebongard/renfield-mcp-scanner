@@ -8,13 +8,14 @@ its behaviour is what the measurements in pipeline.py were taken against.
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import logging
 import re
 import shutil
 import weakref
 from dataclasses import dataclass, field
 from pathlib import Path
+
+from .procs import reap
 
 logger = logging.getLogger("renfield-mcp-scanner.sane")
 
@@ -220,19 +221,12 @@ async def _run(*args: str, timeout: float = 600.0) -> tuple[int, str]:
     return proc.returncode or 0, out.decode("utf-8", "replace")
 
 
-def _reap(proc: asyncio.subprocess.Process) -> None:
-    """Toetet einen noch laufenden `scanimage` SYNCHRON.
-
-    🛑 Kein `await`. Im Abbruchfall ist die Aufgabe bereits am Abbrechen, und
-    ein `await` koennte sofort wieder mit `CancelledError` herausfahren — der
-    Prozess blieb dann trotz Aufraeumens stehen. `kill()` ist synchron und ist
-    der entscheidende Teil: es gibt das USB-Geraet frei. Das Einsammeln des
-    Zombies uebernimmt die Kinderaufsicht der Ereignisschleife.
-    """
-    if proc.returncode is not None:
-        return
-    with contextlib.suppress(ProcessLookupError):
-        proc.kill()
+# Das Einsammeln steht in `procs.reap` — EINE Stelle fuer alle
+# asyncio-Prozesse im Paket, weil hier drei Muster fuer dieselbe Frage
+# nebeneinander standen (Gruppe toeten / Kind toeten / nichts tun). Der Name
+# bleibt, damit Aufrufer und Tests unveraendert sind; `kill()` gibt das
+# USB-Geraet frei.
+_reap = reap
 
 
 async def _probe(*args: str, timeout: float) -> tuple[int, str]:
