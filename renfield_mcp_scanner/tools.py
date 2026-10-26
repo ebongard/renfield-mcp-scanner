@@ -340,15 +340,17 @@ async def scan_document(
     #    Thread laeuft aber zu Ende. Kein Datenschaden — `segment` liest nur.
     #    Ein Herunterfahren kann dadurch bis zu einem Stapeldurchlauf warten.
     #
-    # 2. BILLIGER ginge es vermutlich: `decode_page` oeffnet die Seite in
-    #    voller Aufloesung und wandelt nach RGB (2550x3508x3 = 26 MB je
-    #    Seite), ohne zu verkleinern. Wuerde der Strichcode auch auf halber
-    #    Aufloesung erkannt, waeren aus 411 ms vielleicht 50 ms. 🛑 NICHT
-    #    gemacht, weil nicht messbar: es gibt kein echtes gescanntes
-    #    Trennblatt in den Tests (`decode_page` wird dort immer gepatcht), und
-    #    ein zu stark verkleinertes Blatt wird STILL nicht erkannt — das
-    #    misroutet Dokumente, ohne dass jemand es merkt. Wer das heben will,
-    #    braucht zuerst ein echtes Trennblatt durch den Einzug.
+    # 2. BILLIGER ginge es, und das ist inzwischen GEMESSEN (Review zu #15,
+    #    synthetisches Blatt nach den Parametern aus `sheets.py`): bei 1/3
+    #    Aufloesung faellt zbar von 117 ms auf 7 ms, erkannt wird bis 1/8.
+    #    🛑 Aber es gibt einen BODEN von ~60 ms je Seite fuers Oeffnen des
+    #    PNG — das Verkleinern ist also additiv zu diesem `to_thread`, kein
+    #    Ersatz dafuer. Noch nicht umgesetzt, weil die Messung synthetisch war
+    #    (kein Durchscheinen, keine Falte, kein Schmutz) und ein zu stark
+    #    verkleinertes Blatt STILL nicht erkannt wird — das misroutet einen
+    #    Stapel, ohne dass jemand es merkt. Der Entwurf, der die Frage
+    #    entschaerft: 1/3 versuchen, und nur wenn nichts dekodiert, die volle
+    #    Aufloesung nachschieben. Details und Tabelle im README.
     segments = await asyncio.to_thread(separator.segment, result.pages)
     used_separators = any(s.target_id for s in segments) or len(segments) > 1
 
