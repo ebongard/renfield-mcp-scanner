@@ -581,7 +581,11 @@ Produktions-Mac, mit genau den Produktionsflags, über 2/8/20 Seiten):
 | `ocrmypdf` | ~1,15 s | 5 s |
 
 Budget: `ASSEMBLY_OVERHEAD + ASSEMBLY_PER_PAGE × Seiten` = **60 s + 20 s/Seite**,
-rund das Siebenfache je Seite. Sie soll ein *unbegrenztes* Warten begrenzen,
+**12,5× für `img2pdf` und 17× für `ocrmypdf`** — das Budget gilt je
+Unterprozess, nicht über den ganzen Zusammenbau. (Gegen die Summe beider
+Messwerte wären es 7×; das ist die Rechnung für ein Budget je Auftrag, und
+das ist noch nicht gebaut — s. den Befund zum doppelten `assemble`.) Der
+Faktor ist absichtlich großzügig: sie soll ein *unbegrenztes* Warten begrenzen,
 nicht eine langsame Maschine maßregeln — eine dichte Seite oder ein belasteter
 Rechner darf seine Texterkennung nicht verlieren.
 

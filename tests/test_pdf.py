@@ -7,7 +7,10 @@ gesetzt, jedes `start()` antwortet `busy` — und `watcher_health` meldet weiter
 `ok`. Die Tests halten beides fest: dass die Grenze greift, und dass ein
 Ablauf der Texterkennung das Dokument NICHT kostet.
 """
+import contextlib
 import logging
+import os
+import signal
 import subprocess
 import time
 
@@ -82,27 +85,56 @@ def test_the_timeout_takes_the_whole_family_down(monkeypatch):
         pdfmod._run_bounded(["/bin/sh", "-c", script], 1.0)
     assert pids, "kein Kindprozess beobachtet — der Test misst nichts"
 
+    # 🛑 Nicht `ps -o pid= -g <pgid>`: `-g` ist BSD/macOS-Semantik
+    # („process group leaders"), waehrend es auf Linux Sitzung bzw.
+    # Gruppenname meint. Dort haette der Test etwas anderes geprueft und
+    # waere still gruen geblieben. `killpg(pgid, 0)` fragt die Gruppe direkt
+    # und heisst ueberall dasselbe: Signal 0 sendet nichts, es prueft nur, ob
+    # die Gruppe noch existiert.
     time.sleep(0.5)
-    survivors = subprocess.run(
-        ["ps", "-o", "pid=", "-g", str(pids[0])], capture_output=True, text=True,
-        check=False,
-    ).stdout.split()
-    # Gegengemessen: mit abgeschaltetem `killpg` bleibt der Enkel hier stehen
-    # und der Test wird rot.
-    assert survivors == [], f"Gruppenmitglieder ueberlebten den Ablauf: {survivors}"
+    try:
+        os.killpg(pids[0], 0)
+    except ProcessLookupError:
+        pass                                  # Gruppe weg — so soll es sein
+    else:
+        members = subprocess.run(
+            ["ps", "-o", "pid=,command=", "-g", str(pids[0])],
+            capture_output=True, text=True, check=False).stdout.strip()
+        pytest.fail(f"die Prozessgruppe lebt nach dem Ablauf weiter:\n{members}")
 
 
 def test_a_failed_reap_is_reported_not_swallowed(monkeypatch, caplog):
     """Kehrt `communicate` nach dem SIGKILL NICHT zurueck, haelt noch jemand
     die Rohre — genau das Leck, gegen das `_killpg` gebaut ist. Das darf keine
-    stille Zeile sein."""
+    stille Zeile sein.
+
+    🛑 Das Aufraeumen zielt auf die eigene Prozessgruppe, NICHT auf ein
+    Befehlszeilenmuster. Die erste Fassung nahm `pkill -9 -f "sleep 30"` — und
+    `sleep 30` ist ein Teilstring von `sleep 300`, also erschlug sie den Enkel
+    des Nachbartests und jeden fremden `sleep 300…` auf der Maschine. Ein
+    Fremdeingriff ohne Rueckmeldung wird nicht rot, er beschaedigt still einen
+    anderen Lauf.
+    """
+    pids: list[int] = []
+    real_popen = subprocess.Popen
+
+    def recording_popen(*a, **kw):
+        proc = real_popen(*a, **kw)
+        pids.append(proc.pid)
+        return proc
+
+    monkeypatch.setattr(subprocess, "Popen", recording_popen)
     monkeypatch.setattr(pdfmod, "_killpg", lambda proc: None)   # Gruppe verfehlt
     monkeypatch.setattr(pdfmod, "_REAP_GRACE", 0.5)
-    with caplog.at_level(logging.ERROR), pytest.raises(subprocess.TimeoutExpired):
-        pdfmod._run_bounded(["/bin/sh", "-c", "sleep 30"], 0.5)
-    assert "haelt die Rohre weiter offen" in caplog.text
-    subprocess.run(["pkill", "-9", "-f", "sleep 30"], check=False,
-                   capture_output=True)
+    try:
+        with caplog.at_level(logging.ERROR), pytest.raises(subprocess.TimeoutExpired):
+            pdfmod._run_bounded(["/bin/sh", "-c", "sleep 30"], 0.5)
+        assert "haelt die Rohre weiter offen" in caplog.text
+    finally:
+        # Im `finally`, damit auch eine gefallene Zusicherung nichts stehen laesst.
+        for pid in pids:
+            with contextlib.suppress(ProcessLookupError, PermissionError):
+                os.killpg(pid, signal.SIGKILL)
 
 
 def test_a_healthy_run_returns_its_output():
@@ -153,6 +185,29 @@ def test_an_ocr_timeout_keeps_the_document(tmp_path, monkeypatch, caplog):
     assert out.exists() and out.read_bytes() == b"%PDF-1.4 roh"
     assert not (tmp_path / "scan-raw.pdf").exists()   # umbenannt, nicht kopiert
     assert "timed out" in caplog.text                 # der Grund bleibt lesbar
+
+
+def test_an_ocr_timeout_keeps_the_reason_from_the_output(tmp_path, monkeypatch, caplog):
+    """Ein Zeitablauf darf den Grund nicht auf „timed out" verkuerzen —
+    ocrmypdf sagt in seiner Fehlerausgabe, bei WELCHER Seite es stehenblieb,
+    und das ist beim naechsten Mal die einzige brauchbare Spur."""
+    monkeypatch.setattr(pdfmod, "correct_file", lambda *a, **kw: None)
+
+    def fake(argv, budget):
+        if argv[0] == "img2pdf":
+            (tmp_path / "scan-raw.pdf").write_bytes(b"%PDF-1.4 roh")
+            return subprocess.CompletedProcess(argv, 0, b"", b"")
+        exc = subprocess.TimeoutExpired(argv, budget)
+        exc.stderr = b"Scanning contents: page 7 of 12\nERROR tesseract hing"
+        raise exc
+
+    monkeypatch.setattr(pdfmod, "_run_bounded", fake)
+    with caplog.at_level(logging.WARNING):
+        out = assemble([tmp_path / "p0001.png"], tmp_path, _cfg(tmp_path))
+
+    assert out.read_bytes() == b"%PDF-1.4 roh"      # Dokument bleibt
+    assert "timed out" in caplog.text
+    assert "page 7 of 12" in caplog.text            # und der Grund bleibt lesbar
 
 
 def test_a_failed_ocr_still_reports_its_reason(tmp_path, monkeypatch, caplog):
