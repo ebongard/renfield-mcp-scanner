@@ -30,6 +30,8 @@ import shutil
 from dataclasses import dataclass
 from typing import Any
 
+from .procs import reap
+
 logger = logging.getLogger("renfield-mcp-scanner.usb")
 
 #: Fujitsu. Der Produktname ist lesbar (`ScanSnap S1500`), die Seriennummer
@@ -84,7 +86,18 @@ async def scanner_node() -> UsbNode | None:
             "ioreg", "-a", "-r", "-c", "IOUSBHostDevice", "-l", "-w", "0",
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
         )
-        out, _ = await asyncio.wait_for(proc.communicate(), timeout=_IOREG_TIMEOUT)
+        try:
+            out, _ = await asyncio.wait_for(proc.communicate(), timeout=_IOREG_TIMEOUT)
+        except BaseException:
+            # 🛑 JEDE Beendigung sammelt den Prozess ein, nicht nur der
+            # Zeitablauf — `CancelledError` beim Dienstende eingeschlossen.
+            # Vorher brach nur das `await` ab und `ioreg` lief weiter. Diese
+            # Auskunft wird unter anderem auf den FEHLERPFADEN der
+            # Waechterschleife geholt, die zyklisch wiederkehren: ein
+            # haengendes `ioreg` haette sich dort je Runde angesammelt, und
+            # zwar genau dann, wenn der USB-Stapel klemmt.
+            reap(proc)
+            raise
         nodes = plistlib.loads(out)
     except (TimeoutError, OSError, plistlib.InvalidFileException,
             ValueError, EOFError) as exc:

@@ -547,3 +547,68 @@ class TestBefundCodesHabenEineQuelle:
         r = await tools.watcher_health(_C(), liveness=_Neu(), scanner_node=knoten)
         assert r["ok"] is False, "ein unbekannter Befund-Zustand darf nicht durchfallen"
         assert r["error_code"] == "watcher_finding"
+
+
+# ---------------------------------------------------------------------------
+# `ioreg` wird eingesammelt — die dritte Fassung desselben Riegels
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_a_hanging_ioreg_is_killed_not_abandoned(monkeypatch):
+    """🛑 `scanner_node` brach bei Zeitablauf nur das `await` ab und liess
+    `ioreg` laufen. Geholt wird diese Auskunft unter anderem auf den
+    FEHLERPFADEN der Waechterschleife, die zyklisch wiederkehren — ein
+    haengendes `ioreg` haette sich dort je Runde angesammelt, und zwar genau
+    dann, wenn der USB-Stapel klemmt.
+
+    Gegengemessen: ohne das `reap` bleibt der Prozess hier stehen.
+    """
+    from renfield_mcp_scanner import usb
+
+    started: list = []
+    real_exec = asyncio.create_subprocess_exec
+
+    async def hanging_exec(*argv, **kw):
+        # Statt `ioreg` ein Schlaefer, der die Zeitgrenze sicher reisst.
+        proc = await real_exec("/bin/sh", "-c", "sleep 30", **kw)
+        started.append(proc)
+        return proc
+
+    monkeypatch.setattr(usb.shutil, "which", lambda _: "/usr/sbin/ioreg")
+    monkeypatch.setattr(usb.asyncio, "create_subprocess_exec", hanging_exec)
+    monkeypatch.setattr(usb, "_IOREG_TIMEOUT", 0.3)
+
+    assert await usb.scanner_node() is None      # „keine Auskunft", wirft nie
+    assert started, "kein Prozess beobachtet — der Test misst nichts"
+    await asyncio.sleep(0.2)
+    assert started[0].returncode is not None, (
+        f"ioreg lief nach dem Zeitablauf weiter (PID {started[0].pid})")
+
+
+@pytest.mark.asyncio
+async def test_a_cancelled_ioreg_is_killed_too(monkeypatch):
+    """Dienstende bricht die Aufgabe ab. Auch dann darf nichts stehenbleiben —
+    dieselbe Lehre wie bei `scanimage`: nur die Zeitablauf-Bahn zu raeumen
+    liess beim Abbruch einen Prozess zurueck, der das Betriebsmittel hielt."""
+    from renfield_mcp_scanner import usb
+
+    started: list = []
+    real_exec = asyncio.create_subprocess_exec
+
+    async def hanging_exec(*argv, **kw):
+        proc = await real_exec("/bin/sh", "-c", "sleep 30", **kw)
+        started.append(proc)
+        return proc
+
+    monkeypatch.setattr(usb.shutil, "which", lambda _: "/usr/sbin/ioreg")
+    monkeypatch.setattr(usb.asyncio, "create_subprocess_exec", hanging_exec)
+
+    task = asyncio.create_task(usb.scanner_node())
+    while not started:
+        await asyncio.sleep(0.02)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    await asyncio.sleep(0.2)
+    assert started[0].returncode is not None, (
+        f"ioreg ueberlebte den Abbruch (PID {started[0].pid})")
