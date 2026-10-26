@@ -52,7 +52,7 @@ def test_an_empty_page_list_still_gets_a_budget():
 
 # ------------------------------------------------- die Sippe stirbt mit
 
-def test_the_timeout_takes_the_whole_family_down():
+def test_the_timeout_takes_the_whole_family_down(monkeypatch):
     """🛑 Der Kern: `subprocess.run(timeout=)` toetet nur das Kind.
 
     ocrmypdf haelt bis zu sieben tesseract-Nachkommen. Haengt einer von denen,
@@ -63,16 +63,46 @@ def test_the_timeout_takes_the_whole_family_down():
     # Das Kind startet einen Enkel, der 300 s lebt, und haengt selbst.
     script = "sleep 300 & sleep 300"
 
+    # 🛑 Die Prozessgruppe als Suchschluessel, nicht die Befehlszeile. Ein
+    # `pgrep -f "sleep 300"` trifft JEDEN passenden Prozess der Maschine —
+    # auch einen, den ein vorheriger Fehllauf dieses Tests hinterliess. Dann
+    # entscheidet die Umgebung ueber das Ergebnis, nicht der Code. Mit
+    # `start_new_session` ist die PID des Kindes zugleich seine Gruppenkennung,
+    # und der Enkel erbt sie.
+    pids: list[int] = []
+    real_popen = subprocess.Popen
+
+    def recording_popen(*a, **kw):
+        proc = real_popen(*a, **kw)
+        pids.append(proc.pid)
+        return proc
+
+    monkeypatch.setattr(subprocess, "Popen", recording_popen)
     with pytest.raises(subprocess.TimeoutExpired):
         pdfmod._run_bounded(["/bin/sh", "-c", script], 1.0)
+    assert pids, "kein Kindprozess beobachtet — der Test misst nichts"
 
-    # Der Enkel darf nicht mehr laufen. Gegengemessen: mit abgeschaltetem
-    # `killpg` bleiben hier zwei Prozesse stehen, der Test wird rot.
     time.sleep(0.5)
     survivors = subprocess.run(
-        ["pgrep", "-f", "sleep 300"], capture_output=True, text=True, check=False
+        ["ps", "-o", "pid=", "-g", str(pids[0])], capture_output=True, text=True,
+        check=False,
     ).stdout.split()
-    assert survivors == [], f"Enkel ueberlebten den Zeitablauf: {survivors}"
+    # Gegengemessen: mit abgeschaltetem `killpg` bleibt der Enkel hier stehen
+    # und der Test wird rot.
+    assert survivors == [], f"Gruppenmitglieder ueberlebten den Ablauf: {survivors}"
+
+
+def test_a_failed_reap_is_reported_not_swallowed(monkeypatch, caplog):
+    """Kehrt `communicate` nach dem SIGKILL NICHT zurueck, haelt noch jemand
+    die Rohre — genau das Leck, gegen das `_killpg` gebaut ist. Das darf keine
+    stille Zeile sein."""
+    monkeypatch.setattr(pdfmod, "_killpg", lambda proc: None)   # Gruppe verfehlt
+    monkeypatch.setattr(pdfmod, "_REAP_GRACE", 0.5)
+    with caplog.at_level(logging.ERROR), pytest.raises(subprocess.TimeoutExpired):
+        pdfmod._run_bounded(["/bin/sh", "-c", "sleep 30"], 0.5)
+    assert "haelt die Rohre weiter offen" in caplog.text
+    subprocess.run(["pkill", "-9", "-f", "sleep 30"], check=False,
+                   capture_output=True)
 
 
 def test_a_healthy_run_returns_its_output():

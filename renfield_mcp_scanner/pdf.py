@@ -80,8 +80,18 @@ def _run_bounded(argv: list[str], budget: float) -> subprocess.CompletedProcess[
         out, err = proc.communicate(timeout=budget)
     except subprocess.TimeoutExpired:
         _killpg(proc)
-        with contextlib.suppress(subprocess.TimeoutExpired):
+        try:
             proc.communicate(timeout=_REAP_GRACE)
+        except subprocess.TimeoutExpired:
+            # 🛑 Nicht lautlos verschlucken. Nach einem SIGKILL an die ganze
+            # Gruppe muessen alle Schreibenden der Rohre weg sein, also kehrt
+            # `communicate` sofort zurueck. Tut es das NICHT, haelt noch
+            # jemand das Rohr — ein Prozess, den die Gruppe nicht erfasst hat.
+            # Das ist genau das Leck, gegen das `_killpg` gebaut ist, und in
+            # einem Dauerdienst haeuft es Zombies und Dateideskriptoren an.
+            logger.error(
+                "Nachlese von %s nach dem Abbruch scheiterte — ein Prozess "
+                "haelt die Rohre weiter offen (PID %d)", argv[0], proc.pid)
         raise
     return subprocess.CompletedProcess(argv, proc.returncode or 0, out, err)
 
