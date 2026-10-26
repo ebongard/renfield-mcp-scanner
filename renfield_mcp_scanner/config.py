@@ -95,6 +95,13 @@ class Config(BaseModel):
     white_clip: float = 0.90
     ocr_languages: str = "deu+eng"
     push_timeout_seconds: float = 120.0
+    # 🛑 Hier stand `max_concurrent_pushes` und wurde NIE gelesen (entfernt
+    # 2026-10-26). Wer die Pushes doch begrenzen will, braucht ein echtes
+    # Schloss: `retry_pending_scans` ist ein eigenes Werkzeug OHNE das
+    # Scan-Schloss (`server.py:194`), und der Scan laeuft im Hintergrund —
+    # zwei Pushes koennen also ueberlappen. Die Annahme „seriell durch
+    # Konstruktion" ist falsch, sie war nur folgenlos, weil das Feld
+    # wirkungslos war. Im Review zu #14 belegt.
     # Der blaue Knopf am Gerät startet einen Scan. 🛑 AUS als Vorgabe, und das
     # ist eine MESSUNG, keine Meinung: auf dem ScanSnap S1500 schliessen sich
     # „Knopf jederzeit" und „verklemmt nie" gegenseitig aus.

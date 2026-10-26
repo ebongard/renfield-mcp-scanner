@@ -180,29 +180,72 @@ def test_every_setting_has_a_consumer():
     """🛑 Ein Schalter, der nichts tut, ist eine Luege an den Betreiber.
 
     Wer `SCANNER_HEALTH_POLL_SECONDS=30` setzt, erwartet eine Wirkung. Bis
-    2026-10-26 hatten ZWEI Felder keinen einzigen Verbraucher:
+    2026-10-26 hatten ZWEI Felder keinen einzigen Leser:
 
       * `health_poll_seconds` — seit Einfuehrung nie gelesen.
       * `max_concurrent_pushes` — gemeint war eine Grenze fuer
         Dokument-Pushes; die lebende Semaphore in `jobs.py` liest aber
         `job_event_concurrency` und begrenzt FERTIGMELDUNGEN. Zwei Namen fuer
-        zwei Dinge, eines davon tot. Pushes brauchen die Grenze ohnehin nicht:
-        es laeuft ein Scan zur Zeit, und die Split-Schleife liefert
-        sequenziell.
+        zwei Dinge, eines davon tot.
 
-    Der Gegenleser fand EINEN davon. Dieser Test findet die Klasse.
+    🛑 Geprueft wird der ATTRIBUTZUGRIFF ueber den Syntaxbaum, nicht der Name
+    im Text. Die erste Fassung suchte `\bfeld\b` im Volltext und war damit
+    fast wirkungslos: `device` kommt 40-mal vor, davon nur 7-mal als Zugriff —
+    jedes gleichnamige Lokal, jeder `kwarg` und jeder Kommentar trug den Test.
+    Waere `config.device` stillgelegt worden, waere er gruen geblieben. Er
+    fand genau die zwei Felder, fuer die er geschrieben war, und versprach
+    eine Klasse. Im Review zu #14 gemessen und belegt.
+
+    Gegengemessen: JEDER Zugriff im Paket laeuft ueber `config`, `_config`
+    oder `self._config` als Attribut — der Baum-Pruefer ist damit exakt und
+    ohne Falschmeldung.
     """
-    import re
+    import ast
     from pathlib import Path
 
     from renfield_mcp_scanner.config import Config
 
     paket = Path(__file__).resolve().parents[1] / "renfield_mcp_scanner"
-    text = "\n".join(p.read_text() for p in paket.glob("*.py") if p.name != "config.py")
+    felder = set(Config.model_fields)
+    gelesen: set[str] = set()
+    for datei in paket.rglob("*.py"):
+        if datei.name == "config.py":
+            continue
+        try:
+            baum = ast.parse(datei.read_text(encoding="utf-8"))
+        except SyntaxError:
+            continue
+        for knoten in ast.walk(baum):
+            if isinstance(knoten, ast.Attribute) and knoten.attr in felder:
+                gelesen.add(knoten.attr)
 
-    ohne = [f for f in Config.model_fields
-            if not re.search(rf"\b{re.escape(f)}\b", text)]
+    ohne = sorted(felder - gelesen)
     assert not ohne, (
-        f"diese Einstellungen haben keinen Verbraucher ausserhalb config.py: "
-        f"{sorted(ohne)}. Entweder verdrahten oder entfernen — ein Schalter "
-        "ohne Wirkung taeuscht den Betreiber.")
+        f"diese Einstellungen werden nirgends gelesen: {ohne}. Entweder "
+        "verdrahten oder entfernen — ein Schalter ohne Wirkung taeuscht den "
+        "Betreiber.")
+
+
+def test_the_consumer_check_actually_bites():
+    """Negativkontrolle IM Test: ein Feld, das nur im TEXT vorkommt (Kommentar,
+    gleichnamiges Lokal), darf NICHT als gelesen zaehlen.
+
+    Genau daran scheiterte die erste Fassung. Ohne diese Kontrolle waere
+    „null Treffer" auch bei einem blinden Pruefer gruen.
+    """
+    import ast
+
+    quelle = (
+        "# hier steht nur das WORT health_poll_seconds in einem Kommentar\n"
+        "def f(health_poll_seconds=3):\n"
+        "    health_poll_seconds = health_poll_seconds + 1\n"
+        "    return health_poll_seconds\n"
+        "def g(config):\n"
+        "    return config.device\n"
+    )
+    baum = ast.parse(quelle)
+    gelesen = {n.attr for n in ast.walk(baum) if isinstance(n, ast.Attribute)}
+    assert gelesen == {"device"}, gelesen
+    assert "health_poll_seconds" not in gelesen, (
+        "ein Name im Text darf nicht als Zugriff zaehlen — sonst traegt jeder "
+        "Kommentar den Test")

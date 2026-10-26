@@ -101,4 +101,3 @@ class TargetPusher:
             document_id=body.get("document_id"),
             detail=str(body.get("detail", "")), http_status=200,
         )
-
