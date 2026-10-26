@@ -648,6 +648,25 @@ deskew twice; scanner-side `--swdeskew` *creates* skew on sparse back pages;
 raw colour is strongly blue; duplex show-through needs explicit clearing. Each
 carries its measurement in a comment at the point it is handled.
 
+### Was eine Seite kostet
+
+Drei Schritte je Seite, alle gemessen und alle **off the event loop** — ein
+blockierender Schritt fror den ganzen Server ein, und ein `list_tools` vom
+Backend blieb 12 s unbeantwortet, lang genug, dass dessen Auffrischung den
+Scanner für tot erklärte und den laufenden Aufruf abriss.
+
+| Schritt | je Seite | 100 Seiten (voller Duplex-Einzug) |
+|---|---|---|
+| `separator.segment` (PIL + pyzbar je Seite) | **411 ms** | 41 s |
+| `img2pdf` | ~1,6 s | ~162 s |
+| `ocrmypdf` | ~1,15 s | ~120 s |
+
+`segment` lief bis #14 **blockierend** auf der Schleife. Das war nicht
+theoretisch: 2550×3508 Pixel je Seite, Strichcodesuche auf jeder, und bei
+einem halben Einzug schon 20,5 s Stillstand. Jetzt wie `assemble` in einem
+Thread, und ein Test weist nach, dass die Schleife daneben Arbeit erledigt —
+deterministisch, nicht über Zeitmessung.
+
 ### Das Zeitbudget des Zusammenbaus
 
 `img2pdf` und `ocrmypdf` liefen bis #11 ohne Zeitgrenze. Beide laufen über

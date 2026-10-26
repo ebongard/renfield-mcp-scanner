@@ -324,7 +324,15 @@ async def scan_document(
     #: Eine im Klassifizierer-Zweig gebaute PDF, die die Lieferung
     #: wiederverwendet. `None` heisst „noch keine gebaut".
     pdf_probe = None
-    segments = separator.segment(result.pages)
+    # 🛑 Off the event loop, aus demselben Grund wie `assemble`: `segment`
+    # oeffnet JEDE Seite mit PIL und laesst `pyzbar` einen Strichcode darauf
+    # suchen. Gemessen am 2026-10-26 an echten Seiten (2550x3508): **411 ms je
+    # Seite**. Ein halber Einzug (50 Seiten) fror die Schleife 20,5 s ein, ein
+    # voller Duplex-Stapel (100 Seiten) 41 s — und genau das ist der Fehler,
+    # den der Kommentar in `_deliver` schon beschreibt: ein `list_tools` vom
+    # Backend blieb 12 s unbeantwortet, lang genug, dass dessen Auffrischung
+    # den Scanner fuer tot erklaerte und den laufenden Aufruf abriss.
+    segments = await asyncio.to_thread(separator.segment, result.pages)
     used_separators = any(s.target_id for s in segments) or len(segments) > 1
 
     # SINGLE DOCUMENT — no separator sheets in the stack. Unchanged behaviour.

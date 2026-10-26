@@ -226,3 +226,48 @@ def test_the_intermediate_file_is_invisible_to_a_pdf_glob(tmp_path):
     assert gesehen["roh"].suffix != ".pdf", (
         f"die Zwischendatei heisst {gesehen['roh'].name} — ein `glob('*.pdf')` "
         "koennte sie fuer eine fertige Lieferung halten")
+
+
+async def test_segment_does_not_block_the_event_loop(tmp_path, monkeypatch, wired):
+    """🛑 `separator.segment` öffnet JEDE Seite mit PIL und sucht mit `pyzbar`
+    einen Strichcode. Gemessen an echten Seiten (2550×3508): 411 ms je Seite —
+    ein voller Duplex-Einzug fror die Schleife 41 s ein.
+
+    Derselbe Fehler wie bei `assemble`, und derselbe Nachweis: die Schleife
+    muss ANDERE Arbeit erledigen können, während `segment` noch rechnet. Nicht
+    über Zeitmessung, sondern deterministisch.
+    """
+    import asyncio
+    import threading
+    import time
+
+    monkeypatch.setattr("renfield_mcp_scanner.tools.sane.scan_batch", _Scan(2))
+
+    segment_laeuft = threading.Event()
+    beantwortet = threading.Event()
+    schleife_war_frei = []
+
+    echtes_segment = __import__(
+        "renfield_mcp_scanner.separator", fromlist=["segment"]).segment
+
+    def langsames_segment(pages):
+        segment_laeuft.set()
+        time.sleep(0.3)
+        schleife_war_frei.append(bool(beantwortet.is_set()))
+        return echtes_segment(pages)
+
+    monkeypatch.setattr("renfield_mcp_scanner.separator.segment", langsames_segment)
+
+    async def andere_anfrage():
+        while not segment_laeuft.is_set():
+            await asyncio.sleep(0.001)
+        beantwortet.set()
+
+    await asyncio.gather(
+        scan_document(_cfg(tmp_path, "household"), Staging(tmp_path / "st"),
+                      _Zaehler(), target="household"),
+        andere_anfrage(),
+    )
+    assert schleife_war_frei == [True], (
+        "die Ereignisschleife war waehrend `segment` blockiert — ein langer "
+        "Stapel laesst das Backend den Scanner fuer tot erklaeren")
