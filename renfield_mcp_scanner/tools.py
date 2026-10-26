@@ -324,7 +324,34 @@ async def scan_document(
     #: Eine im Klassifizierer-Zweig gebaute PDF, die die Lieferung
     #: wiederverwendet. `None` heisst „noch keine gebaut".
     pdf_probe = None
-    segments = separator.segment(result.pages)
+    # 🛑 Off the event loop, aus demselben Grund wie `assemble`: `segment`
+    # oeffnet JEDE Seite mit PIL und laesst `pyzbar` einen Strichcode darauf
+    # suchen. Gemessen am 2026-10-26 an echten Seiten (2550x3508): **411 ms je
+    # Seite**. Ein halber Einzug (50 Seiten) fror die Schleife 20,5 s ein, ein
+    # voller Duplex-Stapel (100 Seiten) 41 s — und genau das ist der Fehler,
+    # den der Kommentar in `_deliver` schon beschreibt: ein `list_tools` vom
+    # Backend blieb 12 s unbeantwortet, lang genug, dass dessen Auffrischung
+    # den Scanner fuer tot erklaerte und den laufenden Aufruf abriss.
+    #
+    # ⚠️ Zwei bewusst offene Punkte, im Review zu #15 benannt:
+    #
+    # 1. Ein Abbruch raeumt den Thread NICHT ab. Vorher war `segment`
+    #    ueberhaupt nicht abbrechbar; jetzt gibt es eine Abbruchstelle, der
+    #    Thread laeuft aber zu Ende. Kein Datenschaden — `segment` liest nur.
+    #    Ein Herunterfahren kann dadurch bis zu einem Stapeldurchlauf warten.
+    #
+    # 2. BILLIGER ginge es, und das ist inzwischen GEMESSEN (Review zu #15,
+    #    synthetisches Blatt nach den Parametern aus `sheets.py`): bei 1/3
+    #    Aufloesung faellt zbar von 117 ms auf 7 ms, erkannt wird bis 1/8.
+    #    🛑 Aber es gibt einen BODEN von ~60 ms je Seite fuers Oeffnen des
+    #    PNG — das Verkleinern ist also additiv zu diesem `to_thread`, kein
+    #    Ersatz dafuer. Noch nicht umgesetzt, weil die Messung synthetisch war
+    #    (kein Durchscheinen, keine Falte, kein Schmutz) und ein zu stark
+    #    verkleinertes Blatt STILL nicht erkannt wird — das misroutet einen
+    #    Stapel, ohne dass jemand es merkt. Der Entwurf, der die Frage
+    #    entschaerft: 1/3 versuchen, und nur wenn nichts dekodiert, die volle
+    #    Aufloesung nachschieben. Details und Tabelle im README.
+    segments = await asyncio.to_thread(separator.segment, result.pages)
     used_separators = any(s.target_id for s in segments) or len(segments) > 1
 
     # SINGLE DOCUMENT — no separator sheets in the stack. Unchanged behaviour.

@@ -648,6 +648,74 @@ deskew twice; scanner-side `--swdeskew` *creates* skew on sparse back pages;
 raw colour is strongly blue; duplex show-through needs explicit clearing. Each
 carries its measurement in a comment at the point it is handled.
 
+### Was eine Seite kostet
+
+Drei Schritte je Seite, alle gemessen und alle **off the event loop** — ein
+blockierender Schritt fror den ganzen Server ein, und ein `list_tools` vom
+Backend blieb 12 s unbeantwortet, lang genug, dass dessen Auffrischung den
+Scanner für tot erklärte und den laufenden Aufruf abriss.
+
+| Schritt | je Seite | 100 Seiten (voller Duplex-Einzug) |
+|---|---|---|
+| `separator.segment` (PIL + pyzbar je Seite) | **411 ms** | 41 s |
+| `img2pdf` | ~1,6 s | ~162 s |
+| `ocrmypdf` | ~1,15 s | ~120 s |
+
+`segment` lief bis #15 **blockierend** auf der Schleife. Das war nicht
+theoretisch: 2550×3508 Pixel je Seite, Strichcodesuche auf jeder, und bei
+einem halben Einzug schon 20,5 s Stillstand. Jetzt wie `assemble` in einem
+Thread, und ein Test weist das über einen beidseitigen Handschlag nach — ist
+die Schleife blockiert, läuft seine Wartezeit ab und er fällt.
+
+#### Offene Gelegenheit: vor dem Dekodieren verkleinern
+
+`decode_page` öffnet die Seite in voller Scanauflösung und beeinflusst sie
+nirgends; `Image.draft()` — das einzige Mittel, beim Dekodieren selbst zu
+verkleinern — greift bei PNG nicht. Im Review zu #15 an einem nach den echten
+Parametern aus `sheets.py` nachgebauten Blatt gemessen (1200 px QR,
+`ERROR_CORRECT_H`, `border=4`, plus Blaustich, Rauschen, 1,3° Schräglauf):
+
+| Maßstab | Größe | PNG öffnen | zbar | gesamt | erkannt |
+|---|---|---|---|---|---|
+| 1/1 | 2550×3508 | 57,8 ms | **117,3 ms** | 175,1 ms | ja |
+| 1/2 | 1275×1754 | 67,4 ms | 17,4 ms | 84,7 ms | ja |
+| 1/3 | 850×1169 | 64,4 ms | **7,3 ms** | 71,7 ms | ja |
+| 1/8 | 318×438 | 60,6 ms | 1,3 ms | 61,9 ms | ja |
+
+Dass es bis 1/8 trägt, ist kein Zufall: das Blatt ist dafür entworfen
+(`sheets.py` — großer Code, hoher Kontrast, großzügige Ruhezone, ECC H).
+
+⚠️ **Zwei Messungen, die sich scheinbar widersprechen, und die Auflösung
+gehört dazu:** oben stehen 411 ms je Seite, hier 175 ms bei gleicher
+Auflösung. Die erste lief über echte Scanseiten mit Text, die zweite über ein
+fast leeres Trennblatt. zbars Kosten hängen am INHALT — eine dichte Textseite
+gibt ihm viel mehr Kandidatenregionen zu prüfen als ein weißes Blatt mit einem
+QR-Code. Das ist die plausible Erklärung, nicht gegengemessen. Falls sie
+stimmt, fällt die Ersparnis in der Praxis sogar GRÖSSER aus als die Tabelle
+zeigt, denn Inhaltsseiten sind die Mehrheit.
+
+Drei Folgerungen, und die zweite ist die wichtigste:
+
+1. **zbar ist zwei Drittel der Kosten, und bei 1/3 bleibt davon nichts**
+   (117 → 7 ms).
+2. 🛑 **Es gibt einen Boden von ~60 ms je Seite** für das Öffnen des PNG. Den
+   zahlt man, sobald man die Seite anfasst — 100 Seiten sind auch bei 1/8 noch
+   ~6 s. Das Verkleinern ist also **additiv zu `to_thread`, kein Ersatz**.
+3. `convert("L")` bringt nichts (175,1 → 175,0 ms): zbar wandelt selbst nach
+   Y800. Eine Vermutung, die ihre eigene Messung widerlegt hat.
+
+🛑 **Noch nicht umgesetzt, und zwar aus einem Grund.** Die Messung lief an
+einem SYNTHETISCHEN Blatt: kein Durchscheinen vom Duplex-Rückweg, keine
+Falte, kein Schmutz, kein echter Papierweißpunkt. Ein zu stark verkleinertes
+Blatt wird **still** nicht erkannt, und das misroutet einen Stapel, ohne dass
+jemand es merkt. Der Entwurf, der die Frage entschärft: **1/3 versuchen, und
+nur wenn nichts dekodiert, die volle Auflösung nachschieben.** Dann kostet ein
+Fehlschlag den alten Preis statt eines fehlgeleiteten Stapels, und der
+Rückweg ist dieselbe Funktion statt einer zweiten Codebahn.
+
+Offen ist damit nur noch eine Messung an echtem Papier — ein Trennblatt durch
+den Einzug.
+
 ### Das Zeitbudget des Zusammenbaus
 
 `img2pdf` und `ocrmypdf` liefen bis #11 ohne Zeitgrenze. Beide laufen über
