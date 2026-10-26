@@ -95,8 +95,6 @@ class Config(BaseModel):
     white_clip: float = 0.90
     ocr_languages: str = "deu+eng"
     push_timeout_seconds: float = 120.0
-    max_concurrent_pushes: int = 4
-    health_poll_seconds: int = 60
     # Der blaue Knopf am Gerät startet einen Scan. 🛑 AUS als Vorgabe, und das
     # ist eine MESSUNG, keine Meinung: auf dem ScanSnap S1500 schliessen sich
     # „Knopf jederzeit" und „verklemmt nie" gegenseitig aus.
@@ -257,8 +255,6 @@ def load_config() -> Config:
         white_clip=_env("white_clip", "SCANNER_WHITE_CLIP", float),
         ocr_languages=_env("ocr_languages", "SCANNER_OCR_LANGUAGES"),
         push_timeout_seconds=_env("push_timeout_seconds", "SCANNER_PUSH_TIMEOUT_SECONDS", float),
-        max_concurrent_pushes=_env("max_concurrent_pushes", "SCANNER_MAX_CONCURRENT_PUSHES", int),
-        health_poll_seconds=_env("health_poll_seconds", "SCANNER_HEALTH_POLL_SECONDS", int),
         route_auto_threshold=_env("route_auto_threshold", "SCANNER_ROUTE_AUTO_THRESHOLD", float),
         classifier_url=_env("classifier_url", "SCANNER_CLASSIFIER_URL"),
         classifier_model=_env("classifier_model", "SCANNER_CLASSIFIER_MODEL"),

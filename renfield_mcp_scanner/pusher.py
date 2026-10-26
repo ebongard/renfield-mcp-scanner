@@ -21,7 +21,6 @@ import httpx
 
 from .contract import (
     CONTRACT_HEADER,
-    HEALTH_PATH,
     INGEST_PATH,
     SCANNER_INGEST_CONTRACT_VERSION,
     StageAction,
@@ -103,12 +102,3 @@ class TargetPusher:
             detail=str(body.get("detail", "")), http_status=200,
         )
 
-    async def health(self) -> bool:
-        """Backend liveness probe. Never raises. 401/403 reads as unhealthy —
-        that needs an operator, not an automatic retry."""
-        try:
-            async with httpx.AsyncClient(timeout=15.0, verify=self._verify) as client:
-                resp = await client.get(f"{self._base}{HEALTH_PATH}", headers=self._headers)
-            return resp.status_code == 200
-        except httpx.HTTPError:
-            return False

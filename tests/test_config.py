@@ -174,3 +174,35 @@ def test_an_unknown_flag_value_falls_back_loudly(caplog):
         assert _flag("X", False, lambda n, d="", w=wert: w) is True
     for wert in ("false", "0", "nein", "AUS", " off "):
         assert _flag("X", True, lambda n, d="", w=wert: w) is False
+
+
+def test_every_setting_has_a_consumer():
+    """🛑 Ein Schalter, der nichts tut, ist eine Luege an den Betreiber.
+
+    Wer `SCANNER_HEALTH_POLL_SECONDS=30` setzt, erwartet eine Wirkung. Bis
+    2026-10-26 hatten ZWEI Felder keinen einzigen Verbraucher:
+
+      * `health_poll_seconds` — seit Einfuehrung nie gelesen.
+      * `max_concurrent_pushes` — gemeint war eine Grenze fuer
+        Dokument-Pushes; die lebende Semaphore in `jobs.py` liest aber
+        `job_event_concurrency` und begrenzt FERTIGMELDUNGEN. Zwei Namen fuer
+        zwei Dinge, eines davon tot. Pushes brauchen die Grenze ohnehin nicht:
+        es laeuft ein Scan zur Zeit, und die Split-Schleife liefert
+        sequenziell.
+
+    Der Gegenleser fand EINEN davon. Dieser Test findet die Klasse.
+    """
+    import re
+    from pathlib import Path
+
+    from renfield_mcp_scanner.config import Config
+
+    paket = Path(__file__).resolve().parents[1] / "renfield_mcp_scanner"
+    text = "\n".join(p.read_text() for p in paket.glob("*.py") if p.name != "config.py")
+
+    ohne = [f for f in Config.model_fields
+            if not re.search(rf"\b{re.escape(f)}\b", text)]
+    assert not ohne, (
+        f"diese Einstellungen haben keinen Verbraucher ausserhalb config.py: "
+        f"{sorted(ohne)}. Entweder verdrahten oder entfernen — ein Schalter "
+        "ohne Wirkung taeuscht den Betreiber.")
