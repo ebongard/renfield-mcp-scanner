@@ -23,6 +23,8 @@ Dass der schlafende Mac selbst keinen Alarm erzeugt, löst das Rahmenwerk: es
 """
 from __future__ import annotations
 
+import time
+
 import pytest
 
 from renfield_mcp_scanner import button, tools, usb
@@ -194,3 +196,70 @@ class TestDasWerkzeugFasstDasGeraetNICHTAn:
             await tools.scanner_status(
                 _Cfg(), liveness=_leben(button.WATCHER_ALIVE, finding=False,
                                         device_readable=True))
+
+
+# ---------------------------------------------------------------------------
+# Verklemmung OHNE Wächter — sonst wäre sie unsichtbar
+# ---------------------------------------------------------------------------
+
+async def test_a_wedge_is_still_found_with_the_watcher_off():
+    """🛑 Der Riegel gegen den Neun-Tage-Ausfall durch eine NEUE Tür.
+
+    `device_readable` setzt nur der Wächter. Ist er aus — seit 2026-10-26 die
+    Vorgabe — bleibt es `None`, und der alte `device_wedged`-Zweig kann nie
+    feuern. Ohne Ersatz meldete die einzige Funktionssonde ab dann dauerhaft
+    `ok`, auch im verklemmten Zustand: vom 22. bis 25.10. war das Gerät
+    praktisch durchgehend verklemmt, 640–669 Fehlzeilen am Tag.
+    """
+    r = await tools.watcher_health(
+        _Aus(),
+        liveness=_leben(button.WATCHER_OFF, finding=False, device_readable=None),
+        scanner_node=_knoten(DA),
+        device_held=lambda: False,
+        letzter_zugriff=lambda: {
+            "ok": False, "detail": "no Fujitsu scanner found", "at": time.time() - 600},
+    )
+    assert r["ok"] is False
+    assert r["error_code"] == "device_wedged_last_attempt"
+    assert "no Fujitsu scanner found" in r["error"]
+    # Die Meldung muss sagen, dass es der letzte VERSUCH war, keine Messung:
+    # eine Vergangenheitsform darf keine Gegenwart behaupten.
+    assert "letzte VERSUCH" in r["error"] or "letzter VERSUCH" in r["error"]
+
+
+async def test_no_node_means_no_wedge_even_after_a_failed_access():
+    """Fehlt der Knoten, ist der Scanner aus oder abgesteckt — auf einem
+    Arbeitsplatzrechner der Normalfall, nie ein Befund."""
+    r = await tools.watcher_health(
+        _Aus(),
+        liveness=_leben(button.WATCHER_OFF, finding=False, device_readable=None),
+        scanner_node=_knoten(WEG),
+        device_held=lambda: False,
+        letzter_zugriff=lambda: {"ok": False, "detail": "weg", "at": time.time()},
+    )
+    assert r["ok"] is True
+
+
+async def test_a_successful_last_access_is_no_finding():
+    r = await tools.watcher_health(
+        _Aus(),
+        liveness=_leben(button.WATCHER_OFF, finding=False, device_readable=None),
+        scanner_node=_knoten(DA),
+        device_held=lambda: False,
+        letzter_zugriff=lambda: {"ok": True, "detail": "", "at": time.time()},
+    )
+    assert r["ok"] is True
+
+
+async def test_without_any_access_since_start_there_is_no_verdict():
+    """Keine Auskunft darf nicht als Fehler gelesen werden — dieselbe Regel
+    wie bei einem `ioreg`, das nichts sagt."""
+    r = await tools.watcher_health(
+        _Aus(),
+        liveness=_leben(button.WATCHER_OFF, finding=False, device_readable=None),
+        scanner_node=_knoten(DA),
+        device_held=lambda: False,
+        letzter_zugriff=lambda: None,
+    )
+    assert r["ok"] is True
+    assert r["last_device_open"] is None

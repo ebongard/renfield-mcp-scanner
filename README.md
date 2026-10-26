@@ -179,27 +179,45 @@ Ausweg lassen:
 | Jede Abfrage ist ein `scanimage -d … -A`, also ein voller Öffnungsvorgang | der Takt ist Gerätelast, nicht Prozessorlast |
 | Die IORegistry trägt **keine** Knopf-Eigenschaft (2026-10-26 nachgesehen) | kein freies Signal, das das Öffnen ersetzen könnte |
 
-Dazu die Messung, die die bequeme Erklärung widerlegt: im verklemmten Zustand
-steht `CurrentPowerState == MaxPowerState` (2026-10-26). **Das Gerät schläft
-nicht** — es ist kein Stromsparen und kein Auto-Abschalten, es ist unser
-Abfragen.
+Dazu eine Messung gegen die bequeme Erklärung: im verklemmten Zustand steht
+`CurrentPowerState == MaxPowerState` (`ioreg`, 2026-10-26). Das schließt
+**USB-Suspend** aus — der Bus hält das Gerät bei voller Leistung, es ist also
+nicht der Rechner, der es schlafen legt. ⚠️ Ein **geräteinternes** Standby
+schließt es NICHT aus; dafür gäbe es `Sensors.power_save` aus `sane.py`, und
+das ist im verklemmten Zustand nicht abfragbar — jede Abfrage bräuchte genau
+die Öffnung, die scheitert. Die Auto-Abschaltung ist damit unwahrscheinlich
+gemacht, nicht widerlegt.
 
 Verschärfend, lange übersehen: der Takt hängt an `sensors.page_loaded`
 (`button.py:493`), mit der Begründung „ohne Papier kann der Knopf ohnehin
 nichts auslösen". Der Entwurf nahm an, Papier liege nur kurz vor einem Scan
 ein. Wer den Deckel offen und Papier dauerhaft eingelegt lässt — der
-Normalfall beim Eigentümer — bekommt **fünf Öffnungen je Sekunde rund um die
-Uhr** statt einer.
+Normalfall beim Eigentümer — bekommt nach dem Code **fünf Öffnungen je
+Sekunde** statt einer. ⚠️ Gefolgert, nicht gemessen: die Episoden, auf die
+sich die Zahlen unten stützen, liefen ausdrücklich „NUR `read_sensors`
+(~1/s)", also ohne Papier im Einzug.
 
 ⚠️ **Die DOSIS ist nicht belegt, und zwei Messungen widersprechen sich.** Zehn
 Abfragen je Sekunde setzten das Gerät nach rund einer halben Stunde fest
-(≈ 18.000 Öffnungen); eine Abfrage je Sekunde nach rund 14 Minuten
-(≈ 850 Öffnungen, 2026-10-21, vier Episoden mit 868 s ± 7 s). Das ist in die
-FALSCHE Richtung: ein reiner Öffnungszähler müsste bei höherem Takt früher
-klemmen. Entweder ist eine der beiden Zahlen schlecht erhoben, oder es wirken
-zwei Mechanismen. Solange das offen ist, taugt keine Zahl als Grundlage für
-einen „sicheren" Takt — und genau deshalb ist der Wächter aus und nicht
-langsamer gestellt.
+(≈ 18.000 Öffnungen); eine Abfrage je Sekunde nach rund 14 Minuten. Letzteres
+ist am Protokoll nachgemessen (2026-10-26): **fünf Episoden im Band
+842–872 s**, Mittel ≈ 863 s, Streuung ≈ 11 s — alle am 2026-10-21.
+
+Das ist in die FALSCHE Richtung: ein reiner Öffnungszähler müsste bei höherem
+Takt FRÜHER klemmen. Und die enge Streuung über fünf Läufe passt ebenso gut zu
+einem **Uhrwerk** (fester Zeitgeber um 14,5 min) wie zu einer Dosis bei
+konstantem Takt — alle fünf stammen vom selben Tag, also vermutlich vom selben
+Takt. **Diese Zahl unterscheidet die beiden Erklärungen nicht.**
+
+🛑 **Dass das Abschalten hilft, ist plausibel und NICHT bewiesen.** Gilt die
+Dosis, hilft es vollständig. Gilt das Uhrwerk, verklemmt das Gerät weiter —
+dann allerdings in einem Zustand, in dem auch ein angeforderter Scan
+scheitert, und das wäre vorher wie nachher so. Der entscheidende Versuch ist
+billig: nach einem Aus/Ein mehr als 15 Minuten nichts tun, dann EINEN Scan
+anfordern. Klappt er, war es die Dosis.
+
+Solange das offen ist, taugt keine Zahl als Grundlage für einen „sicheren"
+Takt — und genau deshalb ist der Wächter aus und nicht langsamer gestellt.
 
 Der Wächter (`server.py:310`) ist die einzige periodische Aufgabe, die das
 Gerät anfasst; alles andere öffnet nur auf Anforderung. **Aus heißt: im

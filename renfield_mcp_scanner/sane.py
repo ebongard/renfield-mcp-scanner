@@ -11,6 +11,7 @@ import asyncio
 import logging
 import re
 import shutil
+import time
 import weakref
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -244,9 +245,38 @@ async def _probe(*args: str, timeout: float) -> tuple[int, str]:
             f"eine andere Geraeteprobe hielt das Geraet laenger als {timeout:.0f}s"
         ) from None
     try:
-        return await _run(*args, timeout=timeout)
+        status, out = await _run(*args, timeout=timeout)
     finally:
         lock.release()
+    note_open(status == 0, _last_line(out))
+    return status, out
+
+
+#: Ergebnis des LETZTEN Geräte-Öffnungsvorgangs — Zeitpunkt, Erfolg, Meldung.
+#:
+#: 🛑 Wozu: `device_readable` im Wächterbefund wird NUR vom Wächter gesetzt
+#: (`button.note_device`). Ist der Wächter aus — seit 2026-10-26 die Vorgabe —
+#: bleibt es `None`, und damit könnte die Funktionssonde eine Verklemmung NIE
+#: mehr melden. Das wäre die Rückkehr des Neun-Tage-Ausfalls durch eine neue
+#: Tür: das Gerät war vom 22. bis 25.10. praktisch durchgehend verklemmt, und
+#: ohne diesen Merker hätte das niemand gesagt.
+#:
+#: Dieser Merker kostet NICHTS. Er hält nur fest, wie der letzte Zugriff
+#: ausging, der ohnehin stattfand. Er ist damit ausdrücklich KEINE Probe und
+#: keine Live-Aussage — er sagt „beim letzten Versuch war es so", und die
+#: Sonde formuliert es auch so.
+_LAST_OPEN: dict | None = None
+
+
+def note_open(ok: bool, detail: str = "") -> None:
+    """Hält fest, wie ein Geräte-Öffnungsvorgang ausging."""
+    global _LAST_OPEN
+    _LAST_OPEN = {"ok": ok, "detail": detail, "at": time.time()}
+
+
+def last_open() -> dict | None:
+    """Der letzte Öffnungsvorgang, oder `None` wenn seit dem Start keiner war."""
+    return dict(_LAST_OPEN) if _LAST_OPEN is not None else None
 
 
 def _last_line(out: str) -> str:

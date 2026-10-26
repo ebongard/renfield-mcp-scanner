@@ -126,3 +126,51 @@ def test_the_button_watch_default_is_off():
     from renfield_mcp_scanner.config import Config
 
     assert Config.model_fields["button_watch"].default is False
+
+
+def test_no_default_literal_survives_in_the_loader():
+    """🛑 Der Riegel fuer die KLASSE, nicht fuer den einen Fall.
+
+    Am 2026-10-26 doppelte `load_config` die Modellvorgabe bei 17 von 18
+    Feldern (`env("SCANNER_RESOLUTION", "300")` gegen `resolution: int = 300`).
+    Zwei Quellen fuer denselben Wert driften, und die des Modells ist die
+    wirkungslose — der Dienst baut seine Konfiguration ausschliesslich ueber
+    `load_config`. Der erste Anlauf reparierte nur `button_watch`; dieser Test
+    haelt ALLE zu.
+    """
+    import re
+    from pathlib import Path
+
+    from renfield_mcp_scanner.config import Config
+
+    quelle = Path(__file__).resolve().parents[1] / "renfield_mcp_scanner" / "config.py"
+    text = quelle.read_text()
+    rumpf = text[text.index("def load_config"):text.index("def _default(")]
+
+    # `feld=...env("NAME", "LITERAL")...` — ein zweites Vorgabe-Literal.
+    schuldig = [
+        feld for feld, _name in re.findall(r'(\w+)=\s*[\w.]*\(?\s*env\("([A-Z_0-9]+)",\s*"', rumpf)
+        if feld in Config.model_fields
+        and repr(Config.model_fields[feld].default) != "PydanticUndefined"
+    ]
+    assert not schuldig, (
+        "diese Felder tragen in load_config ein eigenes Vorgabe-Literal, "
+        f"obwohl das Modell schon eins hat: {sorted(set(schuldig))}. "
+        "Benutze `_env(\"feld\", \"SCANNER_NAME\", cast)`.")
+
+
+def test_an_unknown_flag_value_falls_back_loudly(caplog):
+    """Ein Tippfehler darf den Knopfwaechter nicht ANschalten — das setzt das
+    Geraet fest. Und er darf nicht lautlos verpuffen."""
+    import logging
+
+    from renfield_mcp_scanner.config import _flag
+
+    with caplog.at_level(logging.WARNING):
+        assert _flag("SCANNER_BUTTON_WATCH", False, lambda n, d="": "flase") is False
+    assert "weder ja noch nein" in caplog.text
+    # Die ausdrueckliche Ja-Menge gilt weiter, in beiden Sprachen.
+    for wert in ("true", "1", "ja", "AN", " On "):
+        assert _flag("X", False, lambda n, d="", w=wert: w) is True
+    for wert in ("false", "0", "nein", "AUS", " off "):
+        assert _flag("X", True, lambda n, d="", w=wert: w) is False
