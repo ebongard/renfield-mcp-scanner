@@ -82,3 +82,47 @@ def test_a4_is_the_default_page_height():
 def test_no_default_target_exists():
     # A scan that cannot be routed must reach a human, never a fallback.
     assert "default_target" not in Config.model_fields
+
+
+# ---------------------------------------------------------------------------
+# Eine Einstellung, EINE Quelle
+# ---------------------------------------------------------------------------
+
+def test_the_button_flag_has_exactly_one_default(monkeypatch, tmp_path):
+    """🛑 `load_config` darf die Vorgabe NICHT selbst noch einmal hinschreiben.
+
+    Bis 2026-10-26 stand hier `env("SCANNER_BUTTON_WATCH", "true")`, waehrend
+    das Modell `True` trug — zwei Quellen fuer dieselbe Einstellung. Die
+    Vorgabe des Modells war damit toter Code, denn der Dienst baut seine
+    Konfiguration ausschliesslich ueber `load_config`. Beim Abschalten des
+    Knopfwaechters haette genau das die Aenderung unwirksam gemacht: Modell
+    `False`, Dienst weiter `True`.
+    """
+    from renfield_mcp_scanner.config import Config, load_config
+
+    ziele = tmp_path / "targets.yaml"
+    ziele.write_text(
+        "targets:\n"
+        "  - id: household\n"
+        "    label: Haushalt\n"
+        "    base_url: http://b:8000\n"
+        "    token_env: TOK_H\n"
+        "    scan_profile_id: d\n"
+    )
+    monkeypatch.setenv("SCANNER_TARGETS_YAML", str(ziele))
+    monkeypatch.setenv("TOK_H", "t")
+    monkeypatch.delenv("SCANNER_BUTTON_WATCH", raising=False)
+    erwartet = Config.model_fields["button_watch"].default
+    assert load_config().button_watch is erwartet, (
+        "load_config traegt eine eigene Vorgabe — die des Modells ist dann wirkungslos")
+
+
+def test_the_button_watch_default_is_off():
+    """Der Knopfwaechter ist AUS als Vorgabe. Begruendung (gemessen) steht am
+    Feld in `config.py`: der Impuls haelt nicht, jede Abfrage oeffnet das
+    Geraet, und nach einigen hundert Oeffnungen ist der S1500 fuer SANE
+    unansprechbar. Diese Zusicherung ist der Riegel dagegen, dass die Vorgabe
+    unbemerkt zurueckkippt."""
+    from renfield_mcp_scanner.config import Config
+
+    assert Config.model_fields["button_watch"].default is False

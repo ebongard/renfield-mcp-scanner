@@ -97,11 +97,32 @@ class Config(BaseModel):
     push_timeout_seconds: float = 120.0
     max_concurrent_pushes: int = 4
     health_poll_seconds: int = 60
-    # Der blaue Knopf am Gerät startet einen Scan. AN by default: ohne ihn
-    # ist der Scanner nur über einen Agenten bedienbar, und genau das war
-    # die Lücke (2026-09-25). `SCANNER_BUTTON_WATCH=false` schaltet ihn ab,
-    # etwa auf einem Host ohne angeschlossenes Gerät.
-    button_watch: bool = True
+    # Der blaue Knopf am Gerät startet einen Scan. 🛑 AUS als Vorgabe, und das
+    # ist eine MESSUNG, keine Meinung: auf dem ScanSnap S1500 schliessen sich
+    # „Knopf jederzeit" und „verklemmt nie" gegenseitig aus.
+    #
+    #   * Der Knopfimpuls dauert 200–250 ms und HAELT NICHT (gemessen, s.
+    #     Modulkopf von `button.py`). Wer ihn fangen will, muss mindestens
+    #     fuenfmal je Sekunde fragen.
+    #   * Jede Frage ist ein `scanimage -d … -A`, also ein voller
+    #     Geraete-Oeffnungsvorgang. Nach einigen hundert davon ist das Geraet
+    #     fuer SANE unansprechbar (`open … failed: Invalid argument`), und nur
+    #     Aus-/Einschalten hilft — belegt null Selbstheilungen.
+    #   * Die IORegistry traegt KEINE Knopf-Eigenschaft (2026-10-26
+    #     nachgesehen), es gibt also kein freies Signal, das das Oeffnen
+    #     ersetzen koennte.
+    #   * Im verklemmten Zustand steht `CurrentPowerState == MaxPowerState`
+    #     (2026-10-26 gemessen): das Geraet SCHLAEFT nicht. Es ist unser
+    #     Abfragen, nicht Stromsparen.
+    #
+    # Der Wächter ist damit die einzige periodische Aufgabe, die das Geraet
+    # anfasst — aus heisst: im Ruhezustand NULL Oeffnungen. Scannen geht ueber
+    # einen angeforderten Scan (Chat, Weboberfläche, `scan_document`).
+    #
+    # `SCANNER_BUTTON_WATCH=true` schaltet ihn wieder an — fuer Geraete, deren
+    # Sensor den Druck haelt, oder um die Dosis sauber auszumessen. Dann
+    # verklemmt dieses Modell wieder.
+    button_watch: bool = False
     # DELIBERATELY stricter than a suggestion would need. simba_classify can sit
     # at a lower bar because it only prefills a picker and a human corrects it;
     # above THIS threshold a document is filed across a trust boundary with
@@ -226,6 +247,22 @@ def load_config() -> Config:
         caller_targets=caller_targets,
         job_event_retry_hours=float(env("SCANNER_JOB_EVENT_RETRY_HOURS", "24")),
         job_event_concurrency=int(env("SCANNER_JOB_EVENT_CONCURRENCY", "2")),
-        button_watch=env("SCANNER_BUTTON_WATCH", "true").strip().lower()
-        not in ("0", "false", "no", "off"),
+        # 🛑 EINE Quelle fuer die Vorgabe: die der Datenklasse oben. Stand hier
+        # ein eigenes Literal, waere die Vorgabe der Datenklasse toter Code —
+        # der Dienst baut seine Konfiguration ausschliesslich hierueber. Genau
+        # so haette das Abschalten des Knopfwaechters nicht gewirkt.
+        button_watch=_flag("SCANNER_BUTTON_WATCH", _default("button_watch"), env),
     )
+
+
+def _default(field: str):
+    """Die Vorgabe, wie sie im Modell steht — die EINZIGE Quelle."""
+    return Config.model_fields[field].default
+
+
+def _flag(name: str, default: bool, env) -> bool:
+    """Ein Ja/Nein-Schalter aus der Umgebung, mit der Vorgabe des Modells."""
+    raw = env(name, "").strip().lower()
+    if not raw:
+        return default
+    return raw not in ("0", "false", "no", "off")
