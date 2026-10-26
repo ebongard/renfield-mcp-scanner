@@ -234,12 +234,12 @@ async def test_segment_does_not_block_the_event_loop(tmp_path, monkeypatch, wire
     ein voller Duplex-Einzug fror die Schleife 41 s ein.
 
     Derselbe Fehler wie bei `assemble`, und derselbe Nachweis: die Schleife
-    muss ANDERE Arbeit erledigen können, während `segment` noch rechnet. Nicht
-    über Zeitmessung, sondern deterministisch.
+    muss ANDERE Arbeit erledigen können, während `segment` noch rechnet. Über
+    einen beidseitigen Handschlag, nicht über eine Wartezeit — ist die
+    Schleife blockiert, läuft die Wartezeit ab und die Zusicherung fällt.
     """
     import asyncio
     import threading
-    import time
 
     monkeypatch.setattr("renfield_mcp_scanner.tools.sane.scan_batch", _Scan(2))
 
@@ -251,9 +251,15 @@ async def test_segment_does_not_block_the_event_loop(tmp_path, monkeypatch, wire
         "renfield_mcp_scanner.separator", fromlist=["segment"]).segment
 
     def langsames_segment(pages):
+        # 🛑 Ein echter, BEIDSEITIGER Handschlag — kein `time.sleep`. Die erste
+        # Fassung schlief 300 ms und hoffte, dass die Schleife in dieser Zeit
+        # dazukommt; der Docstring nannte das „deterministisch", und das war
+        # es nicht: wird der Schleifen-Thread laenger als 300 ms verdraengt,
+        # flattert der Test. Jetzt WARTET der Arbeiter darauf, dass die
+        # Schleife geantwortet hat. Ist sie blockiert, laeuft die Wartezeit ab
+        # und die Zusicherung faellt — statt zufaellig zu bestehen.
         segment_laeuft.set()
-        time.sleep(0.3)
-        schleife_war_frei.append(bool(beantwortet.is_set()))
+        schleife_war_frei.append(beantwortet.wait(5))
         return echtes_segment(pages)
 
     monkeypatch.setattr("renfield_mcp_scanner.separator.segment", langsames_segment)

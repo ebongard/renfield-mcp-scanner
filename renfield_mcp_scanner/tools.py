@@ -332,6 +332,23 @@ async def scan_document(
     # den der Kommentar in `_deliver` schon beschreibt: ein `list_tools` vom
     # Backend blieb 12 s unbeantwortet, lang genug, dass dessen Auffrischung
     # den Scanner fuer tot erklaerte und den laufenden Aufruf abriss.
+    #
+    # ⚠️ Zwei bewusst offene Punkte, im Review zu #15 benannt:
+    #
+    # 1. Ein Abbruch raeumt den Thread NICHT ab. Vorher war `segment`
+    #    ueberhaupt nicht abbrechbar; jetzt gibt es eine Abbruchstelle, der
+    #    Thread laeuft aber zu Ende. Kein Datenschaden — `segment` liest nur.
+    #    Ein Herunterfahren kann dadurch bis zu einem Stapeldurchlauf warten.
+    #
+    # 2. BILLIGER ginge es vermutlich: `decode_page` oeffnet die Seite in
+    #    voller Aufloesung und wandelt nach RGB (2550x3508x3 = 26 MB je
+    #    Seite), ohne zu verkleinern. Wuerde der Strichcode auch auf halber
+    #    Aufloesung erkannt, waeren aus 411 ms vielleicht 50 ms. 🛑 NICHT
+    #    gemacht, weil nicht messbar: es gibt kein echtes gescanntes
+    #    Trennblatt in den Tests (`decode_page` wird dort immer gepatcht), und
+    #    ein zu stark verkleinertes Blatt wird STILL nicht erkannt — das
+    #    misroutet Dokumente, ohne dass jemand es merkt. Wer das heben will,
+    #    braucht zuerst ein echtes Trennblatt durch den Einzug.
     segments = await asyncio.to_thread(separator.segment, result.pages)
     used_separators = any(s.target_id for s in segments) or len(segments) > 1
 
