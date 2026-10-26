@@ -174,7 +174,7 @@ def test_an_ocr_timeout_keeps_the_document(tmp_path, monkeypatch, caplog):
 
     def fake(argv, budget):
         if argv[0] == "img2pdf":
-            (tmp_path / "scan-raw.pdf").write_bytes(b"%PDF-1.4 roh")
+            (tmp_path / "scan-raw.tmp").write_bytes(b"%PDF-1.4 roh")
             return subprocess.CompletedProcess(argv, 0, b"", b"")
         raise subprocess.TimeoutExpired(argv, budget)
 
@@ -183,7 +183,7 @@ def test_an_ocr_timeout_keeps_the_document(tmp_path, monkeypatch, caplog):
         out = assemble([tmp_path / "p0001.png"], tmp_path, _cfg(tmp_path))
 
     assert out.exists() and out.read_bytes() == b"%PDF-1.4 roh"
-    assert not (tmp_path / "scan-raw.pdf").exists()   # umbenannt, nicht kopiert
+    assert not (tmp_path / "scan-raw.tmp").exists()   # umbenannt, nicht kopiert
     assert "timed out" in caplog.text                 # der Grund bleibt lesbar
 
 
@@ -195,7 +195,7 @@ def test_an_ocr_timeout_keeps_the_reason_from_the_output(tmp_path, monkeypatch, 
 
     def fake(argv, budget):
         if argv[0] == "img2pdf":
-            (tmp_path / "scan-raw.pdf").write_bytes(b"%PDF-1.4 roh")
+            (tmp_path / "scan-raw.tmp").write_bytes(b"%PDF-1.4 roh")
             return subprocess.CompletedProcess(argv, 0, b"", b"")
         exc = subprocess.TimeoutExpired(argv, budget)
         exc.stderr = b"Scanning contents: page 7 of 12\nERROR tesseract hing"
@@ -215,7 +215,7 @@ def test_a_failed_ocr_still_reports_its_reason(tmp_path, monkeypatch, caplog):
 
     def fake(argv, budget):
         if argv[0] == "img2pdf":
-            (tmp_path / "scan-raw.pdf").write_bytes(b"%PDF-1.4 roh")
+            (tmp_path / "scan-raw.tmp").write_bytes(b"%PDF-1.4 roh")
             return subprocess.CompletedProcess(argv, 0, b"", b"")
         return subprocess.CompletedProcess(argv, 2, b"", b"tessdata fuer 'xyz' fehlt")
 

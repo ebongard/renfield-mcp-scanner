@@ -198,7 +198,13 @@ async def _deliver(
     """Assemble one document's pages and push them to one target.
 
     🛑 `pdf_path` ist eine PDF, die dieser Stapel SCHON hat — dann wird nicht
-    erneut gebaut. Ohne diesen Weg lief `assemble` zweimal über denselben
+    erneut gebaut. ⚠️ Das kostet den OCR-WIEDERHOLUNGSVERSUCH: scheiterte die
+    Texterkennung, traegt die behaltene Datei keine Textschicht, und sie wird
+    jetzt unveraendert ausgeliefert statt neu gebaut. Bewusst so — die Ursachen
+    (fehlende tessdata, unlesbare Seite, abgelaufenes Budget) aendern sich
+    durch Wiederholen nicht, und ein zweiter Versuch kostet den vollen
+    Durchlauf. Wer die Textschicht braucht, scannt neu. Im Review zu #13
+    gefunden und hier festgehalten, damit es keine stille Aenderung bleibt. Ohne diesen Weg lief `assemble` zweimal über denselben
     Stapel, und das ist der TEUERSTE Schritt der ganzen Kette:
 
     * Der Klassifizierer-Pfad baut eine Sonden-PDF, um Text daraus zu lesen,
@@ -218,6 +224,25 @@ async def _deliver(
     # refresh to declare the scanner dead and tear down the call in flight.
     if pdf_path is None:
         pdf_path = await asyncio.to_thread(assemble, pages, stage_dir, config, title=title)
+
+    # 🛑 Eine LEERE Datei wird nie eingereicht — derselbe Satz wie „ein
+    # Teilscan wird nie eingereicht", nur in der schlimmsten Form. Der Riegel
+    # steht hier und nicht beim Erzeuger, weil er damit JEDE Quelle deckt:
+    # eine 0-Byte-Zwischendatei aus einem gescheiterten `img2pdf`, eine
+    # abgeschnittene Datei, ein kuenftiger Pfad, den es noch nicht gibt.
+    #
+    # Ohne ihn war die Folge Datenverlust: die leere Datei wird gepusht, die
+    # Gegenseite antwortet `ingested`, und `discard` raeumt die Seiten weg —
+    # das Papier muesste erneut durch den Einzug.
+    if not pdf_path.exists() or pdf_path.stat().st_size == 0:
+        staging.keep(stage_dir, reason="empty_pdf",
+                     detail=f"{pdf_path.name} ist leer — nicht eingereicht",
+                     target=target.id)
+        return _err(
+            f"Der Zusammenbau ergab eine leere Datei ({pdf_path.name}). Der "
+            "Stapel bleibt liegen, damit die Seiten nicht verloren gehen.",
+            "empty_pdf",
+        )
     try:
         token = target.token()
     except MissingTokenError as exc:

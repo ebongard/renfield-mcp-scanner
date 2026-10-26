@@ -15,6 +15,8 @@ Zwei Pfade bauten doppelt:
 Diese Tests ZÄHLEN die Aufrufe. Eine Zusicherung über Laufzeit wäre flatterig,
 eine über die Anzahl ist es nicht.
 """
+import pathlib
+
 import pytest
 
 from renfield_mcp_scanner.classifier import Classification
@@ -153,3 +155,74 @@ async def test_route_scan_assembles_once_without_a_pdf(tmp_path, monkeypatch, wi
     assert out["ok"] is True, out
     assert len(zaehler.aufrufe) == 1, (
         f"assemble lief {len(zaehler.aufrufe)}x statt 1x: {zaehler.aufrufe}")
+
+
+# ---------------------------------------------------------------------------
+# 🛑 Eine leere Datei wird NIE eingereicht
+# ---------------------------------------------------------------------------
+
+async def test_an_empty_pdf_is_never_filed_and_the_pages_survive(tmp_path, monkeypatch, wired):
+    """Der Datenverlust, den die Wiederverwendung eingebaut hatte.
+
+    `assemble` legte die Zwischendatei als `scan-raw.pdf` an und räumte sie auf
+    keinem Fehlerpfad weg; ein gescheitertes `img2pdf` liess sie mit 0 BYTE
+    liegen (gemessen 2026-10-26). Damit sah sie für jeden `glob("*.pdf")` wie
+    eine fertige Lieferung aus, `route_scan` griff sie als `sorted(...)[0]`
+    (sie sortiert vor jedem kleingeschriebenen Titel), und seit der
+    Wiederverwendung baute `_deliver` nicht mehr neu. Die leere Datei wurde
+    eingereicht, die Gegenseite antwortete `ingested`, und `discard` räumte die
+    SEITEN weg — das Papier müsste erneut durch den Einzug.
+
+    Zwei Riegel, hier beide geprüft: die Zwischendatei heisst `.tmp` (kein
+    `*.pdf`-Glob sieht sie), und `_deliver` weigert sich grundsätzlich, eine
+    leere Datei einzureichen.
+    """
+    st = Staging(tmp_path / "st")
+    stage = st.new_stage()
+    (stage / "pages").mkdir(parents=True, exist_ok=True)
+    for i in (1, 2):
+        (stage / "pages" / f"p{i:04d}.png").write_bytes(b"x")
+    # Genau der Rückstand eines gescheiterten `img2pdf` — mit dem ALTEN Namen,
+    # damit der Test auch die Umbenennung absichert.
+    (stage / "scan-raw.pdf").write_bytes(b"")
+    st.keep(stage, reason="scanner_fault")
+
+    zaehler = _Zaehler()
+    out = await route_scan(_cfg(tmp_path, "household"), st, zaehler,
+                           stage.name, "household")
+
+    assert out["ok"] is False, "eine leere Datei darf nicht eingereicht werden"
+    assert out["error_code"] == "empty_pdf", out
+    # Und das Entscheidende: die Seiten sind NOCH DA.
+    assert (stage / "pages" / "p0001.png").exists(), (
+        "die Seiten wurden geräumt — das Papier müsste erneut durch den Einzug")
+    assert list(wired) == [], f"es wurde trotzdem gepusht: {wired}"
+
+
+def test_the_intermediate_file_is_invisible_to_a_pdf_glob(tmp_path):
+    """Die Wurzel: `assemble` darf keine Datei anlegen, die ein `*.pdf`-Glob
+    für eine Lieferung halten kann."""
+    from renfield_mcp_scanner import pdf as pdfmod
+
+    gesehen = {}
+
+    def fake(argv, budget):
+        if argv[0] == "img2pdf":
+            # Der Name der Zwischendatei steht hinter `--output`.
+            roh = pathlib.Path(argv[argv.index("--output") + 1])
+            gesehen["roh"] = roh
+            roh.write_bytes(b"%PDF-1.4")
+            return __import__("subprocess").CompletedProcess(argv, 0, b"", b"")
+        return __import__("subprocess").CompletedProcess(argv, 0, b"", b"")
+
+    monkeypatch_ = pytest.MonkeyPatch()
+    monkeypatch_.setattr(pdfmod, "correct_file", lambda *a, **kw: None)
+    monkeypatch_.setattr(pdfmod, "_run_bounded", fake)
+    try:
+        pdfmod.assemble([tmp_path / "p0001.png"], tmp_path, _cfg(tmp_path, "household"))
+    finally:
+        monkeypatch_.undo()
+
+    assert gesehen["roh"].suffix != ".pdf", (
+        f"die Zwischendatei heisst {gesehen['roh'].name} — ein `glob('*.pdf')` "
+        "koennte sie fuer eine fertige Lieferung halten")

@@ -44,7 +44,8 @@ class AssemblyError(RuntimeError):
 # Das Budget gilt JE UNTERPROZESS, also laesst es 20/1,6 = 12,5x fuer img2pdf
 # und 20/1,15 = 17x fuer ocrmypdf. (Gegen die Summe beider Messwerte waeren es
 # 7x — das ist die Rechnung fuer ein Budget ueber den ganzen Zusammenbau, und
-# das ist noch nicht gebaut, s. den Befund zum doppelten `assemble`.) Der
+# ein solches ist NICHT gebaut: seit #13 laeuft `assemble` nur noch einmal je
+# Dokument, die Grenze selbst gilt aber weiter je Unterprozess.) Der
 # Faktor ist absichtlich grosszuegig: die Grenze soll ein UNBEGRENZTES Warten
 # begrenzen, nicht eine langsame Maschine maßregeln — eine dichte Seite oder
 # ein belasteter Rechner darf seine Texterkennung nicht verlieren.
@@ -163,7 +164,20 @@ def assemble(pages: list[Path], stage: Path, config: Config, title: str = "") ->
     for page in pages:
         correct_file(page, dpi=float(config.resolution), white_clip=config.white_clip)
 
-    raw = stage / "scan-raw.pdf"
+    # 🛑 `.tmp`, NICHT `.pdf`. Diese Zwischendatei wird auf keinem Fehlerpfad
+    # vollstaendig: ein gescheitertes `img2pdf` laesst sie mit 0 BYTE liegen
+    # (gemessen 2026-10-26, `exit=1`, Datei angelegt). Hiess sie `.pdf`, sah
+    # sie fuer jeden `stage.glob("*.pdf")` wie eine fertige Lieferung aus —
+    # `staging.pending()` meldete `has_pdf: true`, `route_scan` griff sie als
+    # `sorted(...)[0]` (sie sortiert vor jedem kleingeschriebenen Titel), und
+    # seit der Wiederverwendung baute `_deliver` nicht mehr neu. Ergebnis: eine
+    # LEERE Datei wird eingereicht, und bei `ingested` raeumt `discard` die
+    # Seiten weg — das Papier muesste erneut durch den Einzug.
+    #
+    # Der Name ist die Wurzel: kein `*.pdf`-Glob kann sie je sehen. Gemessen,
+    # dass beide Werkzeuge die Endung nicht beachten: `img2pdf --output x.tmp`
+    # und `ocrmypdf x.tmp out.pdf` laufen beide durch.
+    raw = stage / "scan-raw.tmp"
     out = stage / output_name(title)
     budget = assembly_budget(len(pages))
     try:
@@ -171,12 +185,16 @@ def assemble(pages: list[Path], stage: Path, config: Config, title: str = "") ->
     except subprocess.TimeoutExpired as exc:
         # Ohne das PDF gibt es nichts abzuliefern — das ist toedlich, anders
         # als ein Fehlschlag der Texterkennung weiter unten.
+        raw.unlink(missing_ok=True)
         raise AssemblyError(f"img2pdf timed out after {budget:.0f}s") from exc
     except OSError as exc:
+        raw.unlink(missing_ok=True)
         raise AssemblyError(f"img2pdf failed: {exc}") from exc
     # 🛑 `_run_bounded` prueft den Rueckgabewert NICHT — es ersetzt
     # `subprocess.run(..., check=True)`, also muss der Riegel hier stehen.
     if done.returncode != 0:
+        # Ein gescheitertes `img2pdf` hinterlaesst eine 0-Byte-Datei (gemessen).
+        raw.unlink(missing_ok=True)
         raise AssemblyError(
             f"img2pdf failed (exit {done.returncode}): "
             f"{done.stderr.decode('utf-8', 'replace').strip()[:400]}"

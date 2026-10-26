@@ -508,6 +508,17 @@ wirkungslos. Seither nimmt `_deliver` eine fertige PDF an (`pdf_path`): die
 Sonden-PDF IST die Lieferung, und ein Stapel, der schon eine PDF trägt, wird
 nicht neu gebaut. Die Tests ZÄHLEN die Aufrufe, sie behaupten keine Laufzeit.
 
+⚠️ **Was die Wiederverwendung kostet, ausdrücklich entschieden:** scheitert die
+Texterkennung, behält `assemble` das PDF ohne Textschicht (das ist der
+gewollte Rückfall — ein Dokument geht nie verloren, weil die OCR scheiterte).
+Vorher baute `route_scan` neu und versuchte die OCR dabei ERNEUT; jetzt wird
+das textlose PDF unverändert ausgeliefert. Das ist bewusst so: ein zweiter
+Versuch kostet den vollen Durchlauf und hat keinen Grund, anders auszugehen —
+die Ursachen sind fehlende `tessdata`, eine unlesbare Seite oder ein
+abgelaufenes Budget, und keine davon ändert sich durch Wiederholen. Wer die
+Textschicht braucht, scannt neu. Im Review zu #13 gefunden und hier
+festgehalten, damit es keine stille Verhaltensänderung bleibt.
+
 Nebenwirkung des Doppellaufs, die niemand gesucht hatte: `output_name` stempelt
 minutengenau, zwei Läufe über eine Minutengrenze hinterliessen also ZWEI PDFs
 im Stapel — eine davon eine Waise. Und `correct_file` korrigiert an der Stelle,
@@ -658,7 +669,8 @@ Budget: `ASSEMBLY_OVERHEAD + ASSEMBLY_PER_PAGE × Seiten` = **60 s + 20 s/Seite*
 **12,5× für `img2pdf` und 17× für `ocrmypdf`** — das Budget gilt je
 Unterprozess, nicht über den ganzen Zusammenbau. (Gegen die Summe beider
 Messwerte wären es 7×; das ist die Rechnung für ein Budget je Auftrag, und
-das ist seit #13 der Fall, aber die Grenze selbst blieb je Unterprozess.) Der
+ein solches ist NICHT gebaut — seit #13 läuft `assemble` nur noch einmal je
+Dokument, die Grenze selbst gilt aber weiter je Unterprozess.) Der
 Faktor ist absichtlich großzügig: sie soll ein *unbegrenztes* Warten begrenzen,
 nicht eine langsame Maschine maßregeln — eine dichte Seite oder ein belasteter
 Rechner darf seine Texterkennung nicht verlieren.
