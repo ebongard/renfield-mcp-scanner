@@ -16,6 +16,14 @@ SCANNER_INGEST_CONTRACT_VERSION = "1"
 CONTRACT_HEADER = "X-Folder-Ingest-Contract"
 
 INGEST_PATH = "/api/folder-ingest/document"
+#: Der Gesundheitsendpunkt der Gegenseite. 🛑 Von DIESER Seite ruft ihn nichts:
+#: `TargetPusher.health()` gab es seit Phase 1 und hatte nie einen Aufrufer, sie
+#: ist 2026-10-26 entfallen. Die Konstante bleibt, weil sie den VERTRAG
+#: beschreibt und der Endpunkt wirklich existiert
+#: (`api/routes/folder_ingest.py`, Prefix `/api/folder-ingest`) — wer die
+#: Erreichbarkeit der Ziele proben will, findet den Weg hier. In
+#: `watcher_health` gehoert sie NICHT: diese Sonde liest ausdruecklich nur
+#: Kostenloses und faesst weder Geraet noch Netz an.
 HEALTH_PATH = "/api/folder-ingest/health"
 
 # Scan-job completion event: the scanner tells the instance that REQUESTED a scan
