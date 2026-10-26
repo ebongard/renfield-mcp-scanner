@@ -489,21 +489,30 @@ gefunden.
 Seit #11 tragen beide Aufrufe eine abgeleitete Zeitgrenze (`60 s +
 20 s/Seite`, s. „Das Zeitbudget des Zusammenbaus"), unbegrenzt ist dort also
 nichts mehr. **Die Wahl bleibt trotzdem richtig, und zwar deutlicher als
-vorher.** Das Budget gilt je UNTERPROZESS, der Ausfall aber je AUFTRAG, und
-dazwischen liegt ein Faktor vier: ein voller Einzug ergibt duplex 100 Seiten
-→ `B` = 2060 s; ein `assemble` zahlt es zweimal (`img2pdf`, dann `ocrmypdf`)
-→ 2·B; und der Klassifizierer-Pfad ruft `assemble` zweimal auf (einmal für
-die Sonden-PDF, einmal in `_deliver`) → **4·B ≈ 2 h 17 min**, das
-22-Fache von `LIVENESS_STALE_AFTER` (370 s). Dazu kommt `correct_file`, das
+vorher.** Das Budget gilt je UNTERPROZESS, der Ausfall aber je AUFTRAG: ein
+voller Einzug ergibt duplex 100 Seiten → `B` = 2060 s, und ein `assemble`
+zahlt es zweimal (`img2pdf`, dann `ocrmypdf`) → **2·B ≈ 69 min**, das
+11-Fache von `LIVENESS_STALE_AFTER` (370 s). Dazu kommt `correct_file`, das
 weiterhin unbegrenzt je Seite läuft.
 
-Eine Grenze, die zwanzigfach jenseits des Lebendigkeitsfensters liegt, taugt
-nicht als Lebendigkeitsgrenze. Die Phase ist die Quelle, nicht der Auftrag —
-und diese Zahl ist der Grund, warum das so bleiben muss. Offen und als Befund
-notiert: der doppelte `assemble` ist unnötige Arbeit (die OCR läuft zweimal
-über denselben Stapel) und zugleich der Grund für die Vervierfachung; ein
-Budget je Auftrag statt je Aufruf gehört dazu. Beides im Review zu #11
-gefunden (B2/B3).
+Eine Grenze, die zehnfach jenseits des Lebendigkeitsfensters liegt, taugt nicht
+als Lebendigkeitsgrenze. Die Phase ist die Quelle, nicht der Auftrag — und
+diese Zahl ist der Grund, warum das so bleiben muss.
+
+**Bis #13 war es 4·B ≈ 2 h 17 min**, weil `assemble` ZWEIMAL über denselben
+Stapel lief: der Klassifizierer baute eine Sonden-PDF, um Text daraus zu
+lesen, und `_deliver` baute dieselbe PDF danach noch einmal. `route_scan` war
+schlimmer — es baute bedingt („falls noch keine da ist") und liess `_deliver`
+danach bedingungslos erneut bauen, der bedingte Aufruf war also vollständig
+wirkungslos. Seither nimmt `_deliver` eine fertige PDF an (`pdf_path`): die
+Sonden-PDF IST die Lieferung, und ein Stapel, der schon eine PDF trägt, wird
+nicht neu gebaut. Die Tests ZÄHLEN die Aufrufe, sie behaupten keine Laufzeit.
+
+Nebenwirkung des Doppellaufs, die niemand gesucht hatte: `output_name` stempelt
+minutengenau, zwei Läufe über eine Minutengrenze hinterliessen also ZWEI PDFs
+im Stapel — eine davon eine Waise. Und `correct_file` korrigiert an der Stelle,
+lief also auch zweimal; gegengemessen verschiebt der zweite Durchlauf maximal
+EINEN Helligkeitswert je Kanal, kostete somit Zeit und nicht Qualität.
 
 Das Gerät wird nur während `scan_batch` gehalten, und das ist durch sein
 eigenes `timeout=1800` begrenzt. **Unbegrenztes Schweigen ist damit
@@ -649,7 +658,7 @@ Budget: `ASSEMBLY_OVERHEAD + ASSEMBLY_PER_PAGE × Seiten` = **60 s + 20 s/Seite*
 **12,5× für `img2pdf` und 17× für `ocrmypdf`** — das Budget gilt je
 Unterprozess, nicht über den ganzen Zusammenbau. (Gegen die Summe beider
 Messwerte wären es 7×; das ist die Rechnung für ein Budget je Auftrag, und
-das ist noch nicht gebaut — s. den Befund zum doppelten `assemble`.) Der
+das ist seit #13 der Fall, aber die Grenze selbst blieb je Unterprozess.) Der
 Faktor ist absichtlich großzügig: sie soll ein *unbegrenztes* Warten begrenzen,
 nicht eine langsame Maschine maßregeln — eine dichte Seite oder ein belasteter
 Rechner darf seine Texterkennung nicht verlieren.
