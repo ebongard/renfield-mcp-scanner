@@ -671,26 +671,38 @@ lowest-confidence segment was a blank page) or were filed as blank documents.
 `--swskip` cannot be tuned against it: a content page measured 7.62 % dark,
 its reverse 3.97 %.
 
+**Dark by default.** `SCANNER_BLANK_BACKS` picks the mode:
+
+| Mode | What happens | `--swskip` |
+|---|---|---|
+| `off` (default) | nothing is measured — the scan is exactly as before | `2.0`, as before |
+| `measure` | every back side is measured and the verdict `drop` WOULD reach is logged (numbers only); nothing is dropped | `2.0`, as before |
+| `drop` | blank back sides are set aside before assembly | `0` (see below) |
+
+Run `measure` on real stacks first and read the log: `would drop N of M
+page(s)` per scan, and one `would drop p000N.png (…)` line per page with its
+measurements. Because `--swskip` stays on in `measure`, a duplex scan can come
+back with an odd page count; then every page is measured and the side is
+reported as unknown. An unknown value (`true`, a typo) falls back to `off`
+with a warning.
+
 A back side (even page of an `ADF Duplex` scan) is dropped only when ALL three
 measurements on the colour-corrected page agree:
 
 | Gate | Setting | Default |
 |---|---|---|
-| OCR (tesseract, `SCANNER_OCR_LANGUAGES`) finds at most N characters | `SCANNER_BLANK_MAX_CHARS` | `30` |
+| OCR (tesseract, `SCANNER_OCR_LANGUAGES`) reads no WORD — three letters or four digits in a row | — | — |
 | mean luminance at 1/4 scale is at least | `SCANNER_BLANK_MIN_LUMINANCE` | `253` |
 | ink area inside the margin, full resolution, after a 3x3 median, is below | `SCANNER_BLANK_INK_FLOOR_MM2` | `2.0` mm² |
-| ink pixel = luminance below / channel spread of at least | `SCANNER_BLANK_INK_LEVEL` / `SCANNER_BLANK_INK_CHROMA` | `200` / `60` |
+| ink pixel = luminance below / channel spread of at least | `SCANNER_BLANK_INK_LEVEL` / `SCANNER_BLANK_INK_CHROMA` | `232` / `24` |
 | border excluded from the ink count | `SCANNER_BLANK_MARGIN_MM` | `5` |
-
-`SCANNER_DROP_BLANK_BACKS=false` switches it off; the scan is then exactly as
-before (including `--swskip 2.0`).
 
 Never dropped: a front side; anything from a simplex scan; anything when a
 duplex scan has an odd page count (parity unproven); the only page of a scan;
 never so much that a scan would be empty. Any doubt keeps the page — an
 unreadable image, OCR that cannot run.
 
-🛑 **While it is active on a duplex scan, `--swskip` is set to 0.** SANE's skip
+🛑 **In `drop` mode on a duplex scan, `--swskip` is set to 0.** SANE's skip
 drops a page inside the backend and renumbers every page after it, which would
 turn backs into fronts. This module replaces it.
 
@@ -700,28 +712,62 @@ document as a blank first page. The measurement is still taken on the
 colour-corrected image (`pipeline.correct`, in memory) — the same pixels the
 PDF gets.
 
-Synthetic pages, measured (A4, 300 dpi, raw blue cast, after correction):
+#### Calibration (probe 2026-10-31)
 
-| Page | mean luminance | ink mm² | verdict |
-|---|---|---|---|
-| blank | 255.00 | 0.00 | dropped |
-| blank with sensor noise, edge shadow, dust | 254.90 | 0.03 | dropped |
-| initials, 8 × 5 mm | 254.97 | 9.4 | kept (ink) |
-| small signature, 35 × 12 mm | 254.92 | 27.8 | kept (ink) |
-| round red stamp, 30 mm | 254.75 | 106.6 | kept (ink) |
-| yellow highlighter mark | 254.94 | 203.8 | kept (ink, via chroma) |
-| light-grey recycled paper with text | **253.36** | 511.9 | kept (ink) |
+Synthetic A4 pages at 300 dpi with the S1500's raw blue cast; marks drawn at a
+fraction of the raw paper colour, so `0.80` is light but plainly visible after
+the correction (~225). Real tesseract; all of these are tests.
 
-The last row is why luminance never decides alone: the correction rescales
-grey paper to white, and a text page then sits above the luminance threshold.
+| Page | ink mm² | verdict |
+|---|---|---|
+| blank | 0.00 | dropped |
+| blank with sensor noise, edge shadow, dust | 0.03 | dropped |
+| show-through of a full text page, raw 0.86 (darkest of the band), diffused / sharp | 0.00 / 0.00 | dropped |
+| show-through raw 0.90; red logo; blue logo | 0.00 | dropped |
+| pencil note "bez. 12.10." at 0.80 / 0.75 | 19.3 / 20.4 | kept (ink) |
+| pencil signature 0.3 mm at 0.80 | 22.1 | kept (ink) |
+| pencil tick, 10 mm, at 0.80 | 6.3 | kept (ink) |
+| pale violet / pale blue stamp ring | 53.8 / 53.8 | kept (ink) |
+| pale red stamp, lighter than the ink level (colour only) | 53.8 | kept (ink, via chroma) |
+| light-grey print "Kontoauszug Nr. 12 Seite 2" at 0.80 | 21.3 | kept (ink) |
+| initials, signature, red stamp, highlighter, grey recycled paper with text | 9.4 … 512 | kept (ink) |
 
-Evidence: each dropped page is logged (job id, stage, page, front, luminance,
-ink, characters — numbers only) and moved to `<stage>/dropped/` with
-`blank-backs.json`. It lives as long as the stage that delivers its document
-(in a mixed stack it travels with its front into the segment's stage), so a
-wrong drop can be recovered until the document is delivered. One INFO line per
-scan counts why every back side was kept; backs kept ONLY by the ink floor are
-listed with their ink area — the calibration data for the floor.
+Where the thresholds come from: after the correction the darkest show-through
+lands at 242-246 and a mark at raw 0.80 at 225, so the ink level is 232
+(raw ~0.82 of paper). Coloured show-through spreads up to 13 (18 before the
+median); a colour-only pale stamp spreads 30, so the chroma floor is 24. The
+first calibration (200 / 60) dropped every faint mark in the table — a test
+holds that as the negative control.
+
+🛑 **The limit:** a mark as faint as show-through (raw 0.85 and lighter, e.g.
+a pencil note at 0.85 or a pale green stamp at 0.86/0.92/0.86) is
+indistinguishable from it and IS dropped. That is why the default is `off` and
+why `measure` comes first.
+
+🛑 **OCR reads a probe, not the page.** On the corrected reverse of a text page
+— show-through at 242-246, invisible to the ink measure — tesseract's adaptive
+binarisation still found the mirrored lines and read 200 junk "words" ("PIE",
+"it:"). The text gate would have kept every show-through back. It therefore
+reads a grey image with everything at or above the ink level set to white. A
+character budget (the first rule, 30) dropped text OCR had READ; one word now
+keeps the page.
+
+#### Evidence and retention
+
+Each dropped page is logged (job id, stage, page, front, luminance, ink,
+characters, words — numbers only) and moved to `<stage>/dropped/` with
+`blank-backs.json`. In a mixed stack it travels with its front into the
+segment's stage. When a stage is discarded after delivery, its `dropped/`
+directory moves to `<staging>/dropped-backs/<stage>/` — the clock restarts at
+delivery — and the retention sweep removes it after
+`SCANNER_STAGING_RETENTION_DAYS`, like any stage. A wrong drop is therefore
+recoverable AFTER delivery, which is when it first shows (a page missing from
+the filed document). One INFO line per scan counts why every back side was
+kept; backs kept ONLY by the ink floor are listed with their ink area — the
+calibration data for the floor.
+
+The job result carries `blank_backs_dropped` (page numbers). Renfield does not
+show it yet: its `ScanJobResult` ignores unknown fields.
 
 Cost (measured on this Mac): about 0.3 s per back side for the image gates
 (open, correct, measure), plus 0.4 s of OCR for each page that passes them.
