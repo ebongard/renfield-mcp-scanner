@@ -10,11 +10,13 @@ from __future__ import annotations
 import json
 import logging
 import math
+import os
 import random
 import shutil
+import time
 
 import pytest
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFilter, ImageFont, ImageOps
 
 from renfield_mcp_scanner import blank
 from renfield_mcp_scanner.config import Config, ScanTarget
@@ -149,7 +151,7 @@ def _save(tmp_path, images) -> list:
 def no_text(image, languages, **_):
     """OCR stand-in for a page without letters. A signature or stamp yields no
     text either, so this is honest for every test that uses it."""
-    return 0
+    return ""
 
 
 def _judge(tmp_path, im, ocr=no_text):
@@ -204,16 +206,17 @@ def test_the_real_ocr_reads_the_dark_paper_page(tmp_path):
     """The text gate with the real engine, not a stand-in: on its own it keeps
     the page even if both image gates were fooled."""
     from renfield_mcp_scanner.pipeline import correct
-    chars = blank.ocr_chars(correct(page_dark_paper_with_text()), "deu+eng", workdir=tmp_path)
-    assert chars is not None and chars > RULES.max_chars
-    assert blank.ocr_chars(correct(page_blank()), "deu+eng", workdir=tmp_path) <= RULES.max_chars
+    text = blank.ocr_text(correct(page_dark_paper_with_text()), "deu+eng", workdir=tmp_path)
+    assert text is not None and blank.count_words(text) > 0
+    assert blank.count_words(blank.ocr_text(correct(page_blank()), "deu+eng",
+                                            workdir=tmp_path)) == 0
     # The probe image lives inside the (private) stage only while OCR runs.
     assert list(tmp_path.iterdir()) == []
 
 
 def test_text_the_image_gates_miss_keeps_the_page(tmp_path):
-    v = _judge(tmp_path, page_blank(), ocr=lambda im, lang: 200)
-    assert not v.drop and v.reason == "text"
+    v = _judge(tmp_path, page_blank(), ocr=lambda im, lang: "Rechnung Nummer 4711")
+    assert not v.drop and v.reason == "text" and v.words == 3
 
 
 def test_ocr_that_cannot_run_keeps_the_page(tmp_path):
@@ -282,6 +285,9 @@ def test_set_aside_keeps_the_evidence_and_logs_numbers_only(tmp_path, caplog):
 # --- through scan_document ---------------------------------------------------
 
 def _cfg(tmp_path, *ids, **over):
+    """A config with the dropping switched ON (the default is off) unless the
+    test says otherwise."""
+    over.setdefault("blank_backs", "drop")
     return Config(
         targets=[ScanTarget(id=i, label=i, base_url="http://b:8000",
                             token_env=f"TOK_{i.upper()}", scan_profile_id="d")
@@ -315,7 +321,7 @@ def wired(tmp_path, monkeypatch):
         return "dev"
 
     monkeypatch.setattr("renfield_mcp_scanner.tools.sane.find_device", dev)
-    monkeypatch.setattr(blank, "ocr_chars", no_text)
+    monkeypatch.setattr(blank, "ocr_text", no_text)
     state = {"pushed": [], "assembled": [], "action": StageAction.DISCARD}
 
     class _P:
@@ -390,7 +396,7 @@ def test_resolve_source_defaults_to_the_configured_source(tmp_path):
 async def test_switched_off_the_scan_is_unchanged(tmp_path, monkeypatch, wired):
     scan = _Scan([page_content(), page_blank()])
     monkeypatch.setattr("renfield_mcp_scanner.tools.sane.scan_batch", scan)
-    out = await scan_document(_cfg(tmp_path, "household", drop_blank_backs=False),
+    out = await scan_document(_cfg(tmp_path, "household", blank_backs="off"),
                               Staging(tmp_path / "st"), wired["assemble"])
     assert "skip_blank" not in scan.kw
     assert wired["assembled"] == [["p0001.png", "p0002.png"]]
@@ -426,19 +432,38 @@ def test_settings_come_from_the_environment(monkeypatch, tmp_path):
                    "    token_env: TOK_H\n    scan_profile_id: d\n")
     monkeypatch.setenv("SCANNER_TARGETS_YAML", str(reg))
     for k in list(__import__("os").environ):
-        if k.startswith(("SCANNER_BLANK_", "SCANNER_DROP_", "SCANNER_PAGE_WIDTH")):
+        if k.startswith(("SCANNER_BLANK_", "SCANNER_PAGE_WIDTH")):
             monkeypatch.delenv(k)
     cfg = load_config()
-    assert cfg.drop_blank_backs is True and cfg.page_width_mm == 210.0
-    assert (cfg.blank_max_chars, cfg.blank_min_luminance, cfg.blank_ink_floor_mm2) == (30, 253.0, 2.0)
+    assert cfg.blank_backs == "off", "dark by default"
+    assert cfg.page_width_mm == 210.0
+    assert (cfg.blank_min_luminance, cfg.blank_ink_level, cfg.blank_ink_chroma,
+            cfg.blank_ink_floor_mm2) == (253.0, 232, 24, 2.0)
 
-    monkeypatch.setenv("SCANNER_DROP_BLANK_BACKS", "false")
+    monkeypatch.setenv("SCANNER_BLANK_BACKS", "Measure")
     monkeypatch.setenv("SCANNER_PAGE_WIDTH_MM", "215.9")
     monkeypatch.setenv("SCANNER_BLANK_INK_FLOOR_MM2", "5")
-    monkeypatch.setenv("SCANNER_BLANK_MAX_CHARS", "10")
     cfg = load_config()
-    assert cfg.drop_blank_backs is False and cfg.page_width_mm == 215.9
-    assert cfg.blank_ink_floor_mm2 == 5.0 and cfg.blank_max_chars == 10
+    assert cfg.blank_backs == "measure" and cfg.page_width_mm == 215.9
+    assert cfg.blank_ink_floor_mm2 == 5.0
+
+    monkeypatch.setenv("SCANNER_BLANK_BACKS", "drop")
+    assert load_config().blank_backs == "drop"
+
+
+def test_an_unknown_mode_falls_back_to_off_loudly(monkeypatch, tmp_path, caplog):
+    """A typo must never switch dropping on — and must not pass unnoticed."""
+    from renfield_mcp_scanner.config import load_config
+    reg = tmp_path / "targets.yaml"
+    reg.write_text("targets:\n  - id: household\n    label: H\n    base_url: http://b\n"
+                   "    token_env: TOK_H\n    scan_profile_id: d\n")
+    monkeypatch.setenv("SCANNER_TARGETS_YAML", str(reg))
+    for value in ("true", "dorp", "yes"):
+        monkeypatch.setenv("SCANNER_BLANK_BACKS", value)
+        with caplog.at_level(logging.WARNING, logger="renfield-mcp-scanner.config"):
+            assert load_config().blank_backs == "off"
+        assert any("SCANNER_BLANK_BACKS" in r.getMessage() for r in caplog.records)
+        caplog.clear()
 
 
 async def test_the_job_carries_sides_and_its_id_into_the_scan(tmp_path):
@@ -492,3 +517,310 @@ async def test_a_crashing_blank_check_keeps_every_page(tmp_path, monkeypatch, wi
     out = await scan_document(_cfg(tmp_path, "household"), Staging(tmp_path / "st"),
                               wired["assemble"])
     assert out["ok"] and wired["assembled"] == [["p0001.png", "p0002.png"]]
+
+
+# --- faint content vs. show-through: the calibration of the ink measure ------
+#
+# Marks are drawn at a FRACTION of the raw paper colour, per channel, so they
+# carry the S1500's blue cast exactly as a real scan does. `pipeline.correct`
+# maps raw 0.90 of paper to white, so a mark at 0.80 comes out at ~225 — light,
+# but plainly visible in the filed PDF. Duplex show-through occupies raw 0.86
+# and lighter (pipeline.py: 200-224 on a ~235 paper) and comes out at 242+.
+
+def _tone(*fraction: float) -> tuple[int, int, int]:
+    f = fraction * 3 if len(fraction) == 1 else fraction
+    return tuple(int(c * k) for c, k in zip(PAPER, f))
+
+
+def page_pencil_note(level: float) -> Image.Image:
+    """A short pencil annotation, "bez. 12.10." — 10 characters OCR may read."""
+    im = page_blank()
+    ImageDraw.Draw(im).text((mm(30), mm(40)), "bez. 12.10.", fill=_tone(level),
+                            font=ImageFont.load_default(size=60))
+    return im
+
+
+def page_pencil_signature(level: float) -> Image.Image:
+    """A 35 mm signature in 0.3 mm graphite, neutral grey."""
+    im = page_blank()
+    d = ImageDraw.Draw(im)
+    x0, y0 = W - mm(60), H - mm(50)
+    pts = [(x0 + mm(35) * t / 200, y0 + mm(6) * math.sin(t / 9.0) * (1 - t / 260))
+           for t in range(200)]
+    d.line(pts, fill=_tone(level), width=mm(0.3))
+    return im
+
+
+def page_pencil_tick(level: float) -> Image.Image:
+    """A 10 mm check mark in 0.3 mm graphite — the smallest note there is."""
+    im = page_blank()
+    x0, y0 = mm(150), mm(200)
+    ImageDraw.Draw(im).line([(x0, y0), (x0 + mm(3), y0 + mm(4)), (x0 + mm(10), y0 - mm(6))],
+                            fill=_tone(level), width=mm(0.3))
+    return im
+
+
+def page_pale_stamp(*fraction: float) -> Image.Image:
+    """A worn office stamp: a 30 mm ring, 0.6 mm, in a pale ink."""
+    im = page_blank()
+    cx, cy, r = mm(105), mm(150), mm(15)
+    ImageDraw.Draw(im).ellipse([cx - r, cy - r, cx + r, cy + r],
+                               outline=_tone(*fraction), width=mm(0.6))
+    return im
+
+
+def page_light_grey_print(level: float) -> Image.Image:
+    """A faint printed line (a worn toner cartridge, a light footer)."""
+    im = page_blank()
+    ImageDraw.Draw(im).text((mm(30), mm(270)), "Kontoauszug Nr. 12 Seite 2",
+                            fill=_tone(level), font=ImageFont.load_default(size=40))
+    return im
+
+
+def page_show_through(*fraction: float, blur: float = 1.5) -> Image.Image:
+    """The reverse of a full text page shining through: mirrored, diffused,
+    with paper grain. *fraction* is its raw darkness relative to the paper;
+    a coloured block stands for a logo when the fraction differs per channel."""
+    rnd = random.Random(3)
+    im = page_blank()
+    d = ImageDraw.Draw(im)
+    font = ImageFont.load_default(size=44)
+    for i in range(45):
+        d.text((mm(20), mm(20) + i * mm(5.8)),
+               "Sehr geehrte Damen und Herren, wir bestaetigen Ihnen den Eingang",
+               fill=_tone(*fraction), font=font)
+    d.rectangle([mm(140), mm(10), mm(190), mm(30)], fill=_tone(*fraction))
+    im = ImageOps.mirror(im)
+    if blur:
+        im = im.filter(ImageFilter.GaussianBlur(blur))
+    px = im.load()
+    for _ in range(60000):
+        x, y = rnd.randrange(W), rnd.randrange(H)
+        dd = rnd.randint(-4, 4)
+        px[x, y] = tuple(max(0, min(255, c + dd)) for c in px[x, y])
+    return im
+
+
+FAINT_MARKS = {
+    "pencil note at 0.80": lambda: page_pencil_note(0.80),
+    "pencil note at 0.75": lambda: page_pencil_note(0.75),
+    "pencil signature at 0.80": lambda: page_pencil_signature(0.80),
+    "pencil tick at 0.80": lambda: page_pencil_tick(0.80),
+    "pale violet stamp": lambda: page_pale_stamp(0.85, 0.75, 0.95),
+    "pale blue stamp": lambda: page_pale_stamp(0.80, 0.85, 1.0),
+    # Lighter than the dark level: only the colour half of the measure sees it.
+    "pale red stamp, colour only": lambda: page_pale_stamp(0.95, 0.80, 0.82),
+    "light grey print at 0.80": lambda: page_light_grey_print(0.80),
+}
+
+SHOW_THROUGH = {
+    "grey, darkest of the band (0.86)": lambda: page_show_through(0.86),
+    "grey 0.86, sharp": lambda: page_show_through(0.86, blur=0),
+    "grey 0.90": lambda: page_show_through(0.90),
+    "red logo": lambda: page_show_through(0.95, 0.86, 0.88),
+    "blue logo": lambda: page_show_through(0.86, 0.88, 0.97),
+}
+
+
+@pytest.mark.parametrize("name", FAINT_MARKS)
+def test_a_faint_mark_keeps_the_page(tmp_path, name):
+    """OCR stubbed to read nothing: the IMAGE gates alone must keep the page."""
+    v = _judge(tmp_path, FAINT_MARKS[name]())
+    assert not v.drop and v.reason == "ink", v
+    # Every one of them is invisible to the page mean.
+    assert v.mean_luminance >= RULES.min_luminance
+
+
+@pytest.mark.parametrize("name", SHOW_THROUGH)
+def test_show_through_alone_is_still_blank(tmp_path, name):
+    v = _judge(tmp_path, SHOW_THROUGH[name]())
+    assert v.drop and v.reason == "blank", v
+
+
+@pytest.mark.parametrize("name", ["pencil note at 0.80", "pale red stamp, colour only",
+                                  "light grey print at 0.80"])
+def test_negative_control_the_first_thresholds_dropped_faint_marks(tmp_path, name):
+    """Under the first calibration (dark below 200, colour from 60) these pages
+    were dropped. If this ever passes with the CURRENT rules, the faint-mark
+    tests above have stopped measuring anything."""
+    old = _rules(blank_ink_level=200, blank_ink_chroma=60)
+    path = _save(tmp_path, [page_content(), FAINT_MARKS[name]()])[1]
+    v = blank.judge_back(path, 2, path.with_name("p0001.png"), old, ocr=no_text)
+    assert v.drop, v
+
+
+# --- the OCR gate: a word keeps the page -------------------------------------
+
+@pytest.mark.parametrize("text,words", [
+    ("", 0),
+    ("| — ee i: ,. ~ ' ii", 0),          # tesseract noise on a speckled blank
+    ("12.10.", 0),                       # digits, but no run of four
+    ("bez. 12.10.", 1),                  # the pencil note: 10 characters, ONE word
+    ("12.10.2026", 1),
+    ("Über", 1),
+    ("Seite 2 von 2", 2),
+])
+def test_what_counts_as_a_word(text, words):
+    assert blank.count_words(text) == words
+
+
+def test_a_short_word_ocr_reads_keeps_the_page(tmp_path):
+    """The first rule allowed 30 characters — and dropped "bez. 12.10." that OCR
+    had read. One word is enough to keep a page."""
+    v = _judge(tmp_path, page_blank(), ocr=lambda im, lang: "bez. 12.10.\n")
+    assert not v.drop and v.reason == "text" and (v.chars, v.words) == (10, 1)
+
+
+def test_ocr_noise_alone_does_not_keep_a_blank_page(tmp_path):
+    v = _judge(tmp_path, page_blank(), ocr=lambda im, lang: " | — ee \n i: ")
+    assert v.drop and v.words == 0
+
+
+@pytest.mark.skipif(shutil.which("tesseract") is None, reason="tesseract not installed")
+@pytest.mark.parametrize("build", [page_noisy_blank, lambda: page_show_through(0.86)])
+def test_the_real_ocr_reads_no_word_on_a_noisy_blank_or_show_through(tmp_path, build):
+    """OCR reads the PROBE image (show-through whitened). On the plain corrected
+    show-through page tesseract read 200 junk words — see the next test."""
+    from renfield_mcp_scanner.pipeline import correct
+    probe = blank.ocr_probe(correct(build()), RULES)
+    text = blank.ocr_text(probe, "deu+eng", workdir=tmp_path)
+    assert text is not None and blank.count_words(text) == 0
+
+
+@pytest.mark.skipif(shutil.which("tesseract") is None, reason="tesseract not installed")
+def test_negative_control_unprobed_ocr_reads_show_through_as_words(tmp_path):
+    """Why the probe exists: without it the text gate keeps every show-through back."""
+    from renfield_mcp_scanner.pipeline import correct
+    text = blank.ocr_text(correct(page_show_through(0.86)), "deu+eng", workdir=tmp_path)
+    assert blank.count_words(text) > 0
+
+
+@pytest.mark.skipif(shutil.which("tesseract") is None, reason="tesseract not installed")
+def test_the_real_ocr_still_reads_light_grey_print_through_the_probe(tmp_path):
+    from renfield_mcp_scanner.pipeline import correct
+    probe = blank.ocr_probe(correct(page_light_grey_print(0.80)), RULES)
+    assert blank.count_words(blank.ocr_text(probe, "deu+eng", workdir=tmp_path)) > 0
+
+
+# --- measure mode -------------------------------------------------------------
+
+async def test_measure_mode_logs_and_changes_nothing(tmp_path, monkeypatch, wired, caplog):
+    scan = _Scan([page_content(), page_blank(), page_content(), page_with_signature()])
+    monkeypatch.setattr("renfield_mcp_scanner.tools.sane.scan_batch", scan)
+    with caplog.at_level(logging.INFO, logger="renfield-mcp-scanner.blank"):
+        out = await scan_document(_cfg(tmp_path, "household", blank_backs="measure"),
+                                  Staging(tmp_path / "st"), wired["assemble"], job_id="j9")
+    assert "skip_blank" not in scan.kw, "measure scans exactly like off — SANE's skip as on main"
+    assert wired["assembled"] == [["p0001.png", "p0002.png", "p0003.png", "p0004.png"]]
+    assert out["ok"] and "blank_backs_dropped" not in out
+    assert not list((tmp_path / "st").rglob("dropped*"))
+    lines = [r.getMessage() for r in caplog.records]
+    assert any("measure only" in m and "would drop 1 of 4" in m for m in lines), lines
+    assert any("would drop p0002.png" in m and "j9" in m and "ink_mm2=" in m for m in lines)
+
+
+def test_measure_on_an_odd_page_count_measures_every_page_without_a_side(tmp_path):
+    pages = _save(tmp_path, [page_content(), page_blank(), page_content()])
+    verdicts = blank.measure(pages, source="ADF Duplex", rules=RULES, ocr=no_text)
+    assert [v.page for v in verdicts] == [1, 2, 3]
+    assert all(v.front == "" for v in verdicts)
+    assert [v.name for v in verdicts if v.drop] == ["p0002.png"]
+
+
+def test_measure_ignores_a_simplex_scan(tmp_path):
+    pages = _save(tmp_path, [page_content(), page_blank()])
+    assert blank.measure(pages, source="ADF Front", rules=RULES, ocr=no_text) == []
+
+
+async def test_a_failing_measurement_never_costs_the_scan(tmp_path, monkeypatch, wired):
+    def boom(*a, **k):
+        raise RuntimeError("bug")
+
+    monkeypatch.setattr(blank, "measure", boom)
+    monkeypatch.setattr("renfield_mcp_scanner.tools.sane.scan_batch",
+                        _Scan([page_content(), page_blank()]))
+    out = await scan_document(_cfg(tmp_path, "household", blank_backs="measure"),
+                              Staging(tmp_path / "st"), wired["assemble"])
+    assert out["ok"] and wired["assembled"] == [["p0001.png", "p0002.png"]]
+
+
+async def test_off_by_default_the_scan_is_unchanged(tmp_path, monkeypatch, wired):
+    """No `blank_backs` given at all: the Config default must be off."""
+    scan = _Scan([page_content(), page_blank()])
+    monkeypatch.setattr("renfield_mcp_scanner.tools.sane.scan_batch", scan)
+    cfg = Config(targets=[ScanTarget(id="household", label="h", base_url="http://b:8000",
+                                     token_env="TOK_HOUSEHOLD", scan_profile_id="d")],
+                 staging_dir=tmp_path / "st")
+    assert cfg.blank_backs == "off"
+    out = await scan_document(cfg, Staging(tmp_path / "st"), wired["assemble"])
+    assert "skip_blank" not in scan.kw
+    assert wired["assembled"] == [["p0001.png", "p0002.png"]]
+    assert "blank_backs_dropped" not in out
+
+
+# --- retention: dropped pages survive delivery --------------------------------
+
+async def test_dropped_pages_survive_delivery_until_the_retention_sweep(
+        tmp_path, monkeypatch, wired):
+    monkeypatch.setattr("renfield_mcp_scanner.tools.sane.scan_batch",
+                        _Scan([page_content(), page_blank()]))
+    staging = Staging(tmp_path / "st")
+    out = await scan_document(_cfg(tmp_path, "household"), staging, wired["assemble"])
+    assert out["ok"] and out["blank_backs_dropped"] == [2]
+    stages = list((tmp_path / "st").glob("scan-*"))
+    assert stages == [], "the delivered stage itself is gone"
+    retained = list((tmp_path / "st" / "dropped-backs").glob("scan-*"))
+    assert len(retained) == 1
+    assert (retained[0] / "p0002.png").exists()
+    record = json.loads((retained[0] / blank.EVIDENCE_FILE).read_text())
+    assert record[0]["page"] == 2 and record[0]["front"] == "p0001.png"
+    # Retained drops are not pending scans.
+    assert staging.pending() == []
+
+    # Young: the sweep keeps them. Past the retention: the sweep takes them.
+    assert staging.purge_expired(30) == 0 and retained[0].exists()
+    old = time.time() - 31 * 86400
+    os.utime(retained[0], (old, old))
+    staging.purge_expired(30)
+    assert not retained[0].exists()
+
+
+def test_the_retention_clock_starts_at_delivery(tmp_path):
+    """A stage kept for days (unrouted) and delivered later: its drops get the
+    full retention from the delivery on, not what is left of it."""
+    staging = Staging(tmp_path / "st")
+    stage = staging.new_stage()
+    (stage / "dropped").mkdir()
+    (stage / "dropped" / "p0002.png").write_bytes(b"png")
+    old = time.time() - 29 * 86400
+    os.utime(stage / "dropped", (old, old))
+    staging.discard(stage)
+    staging.purge_expired(1)
+    assert (tmp_path / "st" / "dropped-backs" / stage.name / "p0002.png").exists()
+
+
+def test_a_stage_without_drops_leaves_no_retained_directory(tmp_path):
+    staging = Staging(tmp_path / "st")
+    stage = staging.new_stage()
+    (stage / "dropped").mkdir()
+    (stage / "dropped" / blank.EVIDENCE_FILE).write_text("[]")   # all moved on
+    staging.discard(stage)
+    assert not stage.exists()
+    assert not (tmp_path / "st" / "dropped-backs").exists()
+
+
+async def test_a_mixed_stack_retains_each_drop_under_its_own_stage(
+        tmp_path, monkeypatch, wired):
+    monkeypatch.setattr("renfield_mcp_scanner.tools.sane.scan_batch",
+                        _Scan([page_content(), page_blank(), page_content(), page_blank()]))
+    monkeypatch.setattr("renfield_mcp_scanner.separator.decode_page",
+                        lambda p: "household" if p.name == "p0001.png" else None)
+    out = await scan_document(_cfg(tmp_path, "household", "office"),
+                              Staging(tmp_path / "st"), wired["assemble"])
+    assert out["ok"] and out["blank_backs_dropped"] == [2, 4]
+    retained = tmp_path / "st" / "dropped-backs"
+    # The separator's back stays with the scan's own stage, the document's back
+    # travelled into the segment's stage: two retained sets, one page each.
+    by_stage = {d.name: sorted(p.name for p in d.glob("p*.png"))
+                for d in retained.glob("scan-*")}
+    assert sorted(by_stage.values()) == [["p0002.png"], ["p0004.png"]], by_stage

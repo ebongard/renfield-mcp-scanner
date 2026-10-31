@@ -119,7 +119,8 @@ async def scan_document(ctx: Context, target: str = "", title: str = "",
 
     `sides` is `simplex` for single-sided paper (front only) or `duplex` for
     both sides; leave it empty for the scanner's configured default. In a
-    duplex scan, blank back sides are dropped automatically.
+    duplex scan, blank back sides are dropped only when the scanner host has
+    that switched on (`SCANNER_BLANK_BACKS=drop`; the default is off).
     """
     config, _ = _ctx()
     if t.resolve_source(config, sides) is None:

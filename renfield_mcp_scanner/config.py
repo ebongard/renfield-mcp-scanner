@@ -18,6 +18,7 @@ from __future__ import annotations
 import logging
 import os
 from pathlib import Path
+from typing import Literal
 
 import yaml
 from pydantic import BaseModel, Field, model_validator
@@ -30,6 +31,10 @@ DEFAULT_SOURCE = "ADF Duplex"
 #: What a caller may ask for at request time (`scan_document(sides=...)`), and
 #: the SANE source each word maps to. Empty = the configured `source`.
 SIDES = {"duplex": "ADF Duplex", "simplex": "ADF Front"}
+
+#: `blank_backs` modes (see `Config.blank_backs`).
+BLANK_BACKS_OFF, BLANK_BACKS_MEASURE, BLANK_BACKS_DROP = "off", "measure", "drop"
+BLANK_BACKS_MODES = (BLANK_BACKS_OFF, BLANK_BACKS_MEASURE, BLANK_BACKS_DROP)
 
 
 class MissingTokenError(RuntimeError):
@@ -105,22 +110,28 @@ class Config(BaseModel):
     page_width_mm: float = 210.0
     white_clip: float = 0.90
     ocr_languages: str = "deu+eng"
-    # Drop blank BACK sides of a duplex scan (blank.py). A page goes only when
-    # all three measurements agree; any doubt keeps it. While active on a
-    # duplex scan SANE's own --swskip is set to 0, because a page skipped inside
-    # the backend shifts the front/back parity this decision rests on.
-    drop_blank_backs: bool = True
-    # OCR: at most this many non-whitespace characters.
-    blank_max_chars: int = 30
+    # Blank BACK sides of a duplex scan (blank.py). Dark by default.
+    #   off     — nothing is measured; the scan is exactly as before.
+    #   measure — every back side is measured and the verdict LOGGED (numbers
+    #             only); nothing is dropped and SANE's --swskip is unchanged.
+    #             This is the calibration mode: run it before `drop`.
+    #   drop    — a back side goes only when every measurement agrees; any
+    #             doubt keeps it. SANE's own --swskip is 0 then, because a page
+    #             skipped inside the backend shifts the front/back parity.
+    blank_backs: Literal["off", "measure", "drop"] = BLANK_BACKS_OFF
     # Mean luminance at a 1/4-scale render, after colour correction (the audit's
     # measure). Blank backs measured 254-255; text pages reach 255 too, which is
     # why this alone never decides.
     blank_min_luminance: float = 253.0
-    # Ink pixel: luminance below this (after correction, show-through sits at
-    # ~240 and above) ...
-    blank_ink_level: int = 200
-    # ... or a channel spread of at least this (a coloured stamp or highlighter).
-    blank_ink_chroma: int = 60
+    # Ink pixel: luminance below this, after correction. Probe 2026-10-31 (S1500
+    # cast, 3x3 median): the darkest duplex show-through (raw 0.86 of paper)
+    # lands at 242-246; a light pencil stroke or grey print at raw 0.80 lands at
+    # 225. 232 sits between with margin to both (raw ~0.82 of paper).
+    blank_ink_level: int = 232
+    # ... or a channel spread of at least this. Coloured show-through measured
+    # up to 13 (18 before the median); pale stamps that only colour reveals
+    # (luminance above the level) measured 30. 24 leaves margin to both.
+    blank_ink_chroma: int = 24
     # Ink area at full resolution, inside the margin, at or above which the page
     # is KEPT. 2 mm² is a few millimetres of pen stroke; a signature measures
     # tens of mm². Sensor noise is median-filtered away before counting.
@@ -295,8 +306,8 @@ def load_config() -> Config:
         page_width_mm=_env("page_width_mm", "SCANNER_PAGE_WIDTH_MM", float),
         white_clip=_env("white_clip", "SCANNER_WHITE_CLIP", float),
         ocr_languages=_env("ocr_languages", "SCANNER_OCR_LANGUAGES"),
-        drop_blank_backs=_flag("SCANNER_DROP_BLANK_BACKS", _default("drop_blank_backs"), env),
-        blank_max_chars=_env("blank_max_chars", "SCANNER_BLANK_MAX_CHARS", int),
+        blank_backs=_choice("SCANNER_BLANK_BACKS", _default("blank_backs"),
+                            BLANK_BACKS_MODES, env),
         blank_min_luminance=_env("blank_min_luminance", "SCANNER_BLANK_MIN_LUMINANCE", float),
         blank_ink_level=_env("blank_ink_level", "SCANNER_BLANK_INK_LEVEL", int),
         blank_ink_chroma=_env("blank_ink_chroma", "SCANNER_BLANK_INK_CHROMA", int),
@@ -321,6 +332,22 @@ def load_config() -> Config:
 def _default(field: str):
     """Die Vorgabe, wie sie im Modell steht — die EINZIGE Quelle."""
     return Config.model_fields[field].default
+
+
+def _choice(name: str, default: str, allowed: tuple[str, ...], env) -> str:
+    """One of a fixed set of words from the environment, with the model's default.
+
+    Same rule as `_flag`: an unknown value falls back to the default LOUDLY —
+    a typo must neither switch a mode on nor pass unnoticed.
+    """
+    raw = env(name, "").strip().lower()
+    if not raw:
+        return default
+    if raw in allowed:
+        return raw
+    logger.warning("%s=%r is not one of %s — the default %r applies",
+                   name, raw, "/".join(allowed), default)
+    return default
 
 
 _JA = ("1", "true", "yes", "on", "ja", "an")

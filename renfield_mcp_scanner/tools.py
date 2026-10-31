@@ -10,7 +10,13 @@ from collections.abc import Awaitable, Callable
 from pathlib import Path
 
 from . import audit, blank, button, classifier, sane, separator, usb
-from .config import SIDES, Config, MissingTokenError
+from .config import (
+    BLANK_BACKS_DROP,
+    BLANK_BACKS_MEASURE,
+    SIDES,
+    Config,
+    MissingTokenError,
+)
 from .contract import StageAction
 from .pusher import TargetPusher
 from .router import Routing, route
@@ -40,7 +46,7 @@ async def list_scanners(config: Config) -> dict:
                      "page_width_mm": config.page_width_mm,
                      "page_height_mm": config.page_height_mm,
                      "sides": sorted(SIDES),
-                     "drop_blank_backs": config.drop_blank_backs},
+                     "blank_backs": config.blank_backs},
         "targets": [{"id": t.id, "label": t.label} for t in config.targets],
     }
 
@@ -300,7 +306,6 @@ def invalid_sides(sides: str) -> dict:
 
 def blank_rules(config: Config) -> blank.BlankRules:
     return blank.BlankRules(
-        max_chars=config.blank_max_chars,
         min_luminance=config.blank_min_luminance,
         ink_level=config.blank_ink_level,
         ink_chroma=config.blank_ink_chroma,
@@ -327,6 +332,18 @@ def _drop_blank_backs(config: Config, stage_dir: Path, pages: list[Path], *,
     return kept, dropped
 
 
+def _measure_blank_backs(config: Config, stage_dir: Path, pages: list[Path], *,
+                         source: str, job_id: str) -> None:
+    """Blocking, ``measure`` mode: log the verdicts, touch nothing. A failure
+    here costs the measurement only — the scan goes on unchanged."""
+    try:
+        verdicts = blank.measure(pages, source=source, rules=blank_rules(config))
+        blank.report_measured(stage_dir, verdicts, job_id=job_id, total=len(pages))
+    except Exception:  # measuring must never cost the scan
+        logger.exception("job %s stage %s: blank measurement failed — nothing changed",
+                         job_id or "-", stage_dir.name)
+
+
 async def scan_document(
     config: Config, staging, assemble, *, target: str = "", title: str = "",
     sides: str = "", job_id: str = "",
@@ -348,8 +365,11 @@ async def scan_document(
     if routing.target is None and target:
         return _err(routing.reason, "unknown_target")
     # Blank back sides are decided HERE, on front/back parity — which only
-    # holds when SANE skips nothing itself (see blank.py).
-    drop_blanks = config.drop_blank_backs and source == blank.DUPLEX_SOURCE
+    # holds when SANE skips nothing itself (see blank.py). Only `drop` changes
+    # the SANE call; `off` and `measure` scan exactly as before.
+    duplex = source == blank.DUPLEX_SOURCE
+    drop_blanks = config.blank_backs == BLANK_BACKS_DROP and duplex
+    measure_blanks = config.blank_backs == BLANK_BACKS_MEASURE and duplex
 
     try:
         device = await sane.find_device(config.device)
@@ -391,6 +411,9 @@ async def scan_document(
     if drop_blanks:
         pages, dropped = await asyncio.to_thread(
             _drop_blank_backs, config, stage_dir, pages, source=source, job_id=job_id)
+    elif measure_blanks:
+        await asyncio.to_thread(
+            _measure_blank_backs, config, stage_dir, pages, source=source, job_id=job_id)
 
     def _noted(out: dict) -> dict:
         if dropped:
