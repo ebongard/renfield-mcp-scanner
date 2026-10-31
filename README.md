@@ -595,7 +595,7 @@ Aufwachsignal — „Knoten da" beweist nicht „Gerät benutzbar".
 |---|---|
 | `list_scanners` | The attached scanner, its settings, configured targets |
 | `scanner_status` | Real hardware state from the SANE sensors — never inferred — plus whether the button watcher is alive |
-| `scan_document` | START a scan job (feed, correct, route, push in the background); returns a `job_id` at once, `busy` while another scan runs |
+| `scan_document` | START a scan job (feed, correct, route, push in the background); returns a `job_id` at once, `busy` while another scan runs. `sides`: `duplex` / `simplex` (`ADF Front`) for this scan, empty = `SCANNER_SOURCE` |
 | `scan_job_status` | How a job stands or ended — for an explicit question, not for polling |
 | `list_pending_scans` | Scans held here awaiting a decision or a retry |
 | `retry_pending_scans` | Re-send scans kept after a failed push |
@@ -647,6 +647,84 @@ off every A4 page; ocrmypdf's default optimizer transcodes to lossy JPEG; never
 deskew twice; scanner-side `--swdeskew` *creates* skew on sparse back pages;
 raw colour is strongly blue; duplex show-through needs explicit clearing. Each
 carries its measurement in a comment at the point it is handled.
+
+### Scan options and page geometry
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `SCANNER_SOURCE` | `ADF Duplex` | SANE source when a request does not choose |
+| `scan_document(sides=…)` | empty | `duplex` = `ADF Duplex`, `simplex` = `ADF Front` (front only), for this one scan; anything else is refused with `invalid_sides` before the feeder moves |
+| `SCANNER_PAGE_WIDTH_MM` | `210` | A4 width. The fujitsu backend defaults to US-Letter width (215.9 mm, 2550 px at 300 dpi); sane-fujitsu(5) says page-width is "used by scanner to determine centering of scan coordinates when using the ADF", so 210 narrows the window symmetrically around the centred paper path. `215.9` restores the old geometry |
+| `SCANNER_PAGE_HEIGHT_MM` | `297` | A4 height (SANE defaults to US Letter and cuts 17.7 mm off) |
+
+After the first scan with the new width, check one page: `pdfimages -list`
+should show 2480 px wide (210 mm at 300 dpi) and both paper edges should be
+on the page. That is the one thing the documentation states and no test here
+can prove.
+
+### Blank back sides (`blank.py`)
+
+Audit 2026-10-31 (last 30 batches, both instances): 24 % / 33 % of all pages
+were near-blank BACK sides of single-sided paper fed in duplex. They stalled
+Renfield's PDF-split review (8 of 30 batches, up to ten days — the
+lowest-confidence segment was a blank page) or were filed as blank documents.
+`--swskip` cannot be tuned against it: a content page measured 7.62 % dark,
+its reverse 3.97 %.
+
+A back side (even page of an `ADF Duplex` scan) is dropped only when ALL three
+measurements on the colour-corrected page agree:
+
+| Gate | Setting | Default |
+|---|---|---|
+| OCR (tesseract, `SCANNER_OCR_LANGUAGES`) finds at most N characters | `SCANNER_BLANK_MAX_CHARS` | `30` |
+| mean luminance at 1/4 scale is at least | `SCANNER_BLANK_MIN_LUMINANCE` | `253` |
+| ink area inside the margin, full resolution, after a 3x3 median, is below | `SCANNER_BLANK_INK_FLOOR_MM2` | `2.0` mm² |
+| ink pixel = luminance below / channel spread of at least | `SCANNER_BLANK_INK_LEVEL` / `SCANNER_BLANK_INK_CHROMA` | `200` / `60` |
+| border excluded from the ink count | `SCANNER_BLANK_MARGIN_MM` | `5` |
+
+`SCANNER_DROP_BLANK_BACKS=false` switches it off; the scan is then exactly as
+before (including `--swskip 2.0`).
+
+Never dropped: a front side; anything from a simplex scan; anything when a
+duplex scan has an odd page count (parity unproven); the only page of a scan;
+never so much that a scan would be empty. Any doubt keeps the page — an
+unreadable image, OCR that cannot run.
+
+🛑 **While it is active on a duplex scan, `--swskip` is set to 0.** SANE's skip
+drops a page inside the backend and renumbers every page after it, which would
+turn backs into fronts. This module replaces it.
+
+🛑 **It runs BEFORE separator segmentation**: the parity belongs to the whole
+scan, and a separator sheet's blank back would otherwise open the next
+document as a blank first page. The measurement is still taken on the
+colour-corrected image (`pipeline.correct`, in memory) — the same pixels the
+PDF gets.
+
+Synthetic pages, measured (A4, 300 dpi, raw blue cast, after correction):
+
+| Page | mean luminance | ink mm² | verdict |
+|---|---|---|---|
+| blank | 255.00 | 0.00 | dropped |
+| blank with sensor noise, edge shadow, dust | 254.90 | 0.03 | dropped |
+| initials, 8 × 5 mm | 254.97 | 9.4 | kept (ink) |
+| small signature, 35 × 12 mm | 254.92 | 27.8 | kept (ink) |
+| round red stamp, 30 mm | 254.75 | 106.6 | kept (ink) |
+| yellow highlighter mark | 254.94 | 203.8 | kept (ink, via chroma) |
+| light-grey recycled paper with text | **253.36** | 511.9 | kept (ink) |
+
+The last row is why luminance never decides alone: the correction rescales
+grey paper to white, and a text page then sits above the luminance threshold.
+
+Evidence: each dropped page is logged (job id, stage, page, front, luminance,
+ink, characters — numbers only) and moved to `<stage>/dropped/` with
+`blank-backs.json`. It lives as long as the stage that delivers its document
+(in a mixed stack it travels with its front into the segment's stage), so a
+wrong drop can be recovered until the document is delivered. One INFO line per
+scan counts why every back side was kept; backs kept ONLY by the ink floor are
+listed with their ink area — the calibration data for the floor.
+
+Cost (measured on this Mac): about 0.3 s per back side for the image gates
+(open, correct, measure), plus 0.4 s of OCR for each page that passes them.
 
 ### Was eine Seite kostet
 

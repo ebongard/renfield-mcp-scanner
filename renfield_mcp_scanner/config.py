@@ -27,6 +27,10 @@ logger = logging.getLogger("renfield-mcp-scanner.config")
 DEFAULT_MODE = "Color"
 DEFAULT_SOURCE = "ADF Duplex"
 
+#: What a caller may ask for at request time (`scan_document(sides=...)`), and
+#: the SANE source each word maps to. Empty = the configured `source`.
+SIDES = {"duplex": "ADF Duplex", "simplex": "ADF Front"}
+
 
 class MissingTokenError(RuntimeError):
     """A target's push token env var is unset. Names the variable."""
@@ -92,8 +96,37 @@ class Config(BaseModel):
     mode: str = DEFAULT_MODE
     source: str = DEFAULT_SOURCE
     page_height_mm: float = 297.0     # A4. SANE defaults to US Letter — see pipeline.
+    # A4 width. SANE's fujitsu default is US Letter width (215.9 mm), so every
+    # page came out 2550 px wide with a 2.95 mm strip beside the paper on each
+    # side. sane-fujitsu(5): page-width "is used by scanner to determine
+    # centering of scan coordinates when using the ADF" — the window is centred
+    # on the paper path, so 210 mm does not clip a centred A4 sheet. Set
+    # SCANNER_PAGE_WIDTH_MM=215.9 to return to the previous geometry.
+    page_width_mm: float = 210.0
     white_clip: float = 0.90
     ocr_languages: str = "deu+eng"
+    # Drop blank BACK sides of a duplex scan (blank.py). A page goes only when
+    # all three measurements agree; any doubt keeps it. While active on a
+    # duplex scan SANE's own --swskip is set to 0, because a page skipped inside
+    # the backend shifts the front/back parity this decision rests on.
+    drop_blank_backs: bool = True
+    # OCR: at most this many non-whitespace characters.
+    blank_max_chars: int = 30
+    # Mean luminance at a 1/4-scale render, after colour correction (the audit's
+    # measure). Blank backs measured 254-255; text pages reach 255 too, which is
+    # why this alone never decides.
+    blank_min_luminance: float = 253.0
+    # Ink pixel: luminance below this (after correction, show-through sits at
+    # ~240 and above) ...
+    blank_ink_level: int = 200
+    # ... or a channel spread of at least this (a coloured stamp or highlighter).
+    blank_ink_chroma: int = 60
+    # Ink area at full resolution, inside the margin, at or above which the page
+    # is KEPT. 2 mm² is a few millimetres of pen stroke; a signature measures
+    # tens of mm². Sensor noise is median-filtered away before counting.
+    blank_ink_floor_mm2: float = 2.0
+    # Border excluded from the ink count: paper edges and their shadow lines.
+    blank_margin_mm: float = 5.0
     push_timeout_seconds: float = 120.0
     # 🛑 Hier stand `max_concurrent_pushes` und wurde NIE gelesen (entfernt
     # 2026-10-26). Wer die Pushes doch begrenzen will, braucht ein echtes
@@ -259,8 +292,16 @@ def load_config() -> Config:
         mode=_env("mode", "SCANNER_MODE"),
         source=_env("source", "SCANNER_SOURCE"),
         page_height_mm=_env("page_height_mm", "SCANNER_PAGE_HEIGHT_MM", float),
+        page_width_mm=_env("page_width_mm", "SCANNER_PAGE_WIDTH_MM", float),
         white_clip=_env("white_clip", "SCANNER_WHITE_CLIP", float),
         ocr_languages=_env("ocr_languages", "SCANNER_OCR_LANGUAGES"),
+        drop_blank_backs=_flag("SCANNER_DROP_BLANK_BACKS", _default("drop_blank_backs"), env),
+        blank_max_chars=_env("blank_max_chars", "SCANNER_BLANK_MAX_CHARS", int),
+        blank_min_luminance=_env("blank_min_luminance", "SCANNER_BLANK_MIN_LUMINANCE", float),
+        blank_ink_level=_env("blank_ink_level", "SCANNER_BLANK_INK_LEVEL", int),
+        blank_ink_chroma=_env("blank_ink_chroma", "SCANNER_BLANK_INK_CHROMA", int),
+        blank_ink_floor_mm2=_env("blank_ink_floor_mm2", "SCANNER_BLANK_INK_FLOOR_MM2", float),
+        blank_margin_mm=_env("blank_margin_mm", "SCANNER_BLANK_MARGIN_MM", float),
         push_timeout_seconds=_env("push_timeout_seconds", "SCANNER_PUSH_TIMEOUT_SECONDS", float),
         route_auto_threshold=_env("route_auto_threshold", "SCANNER_ROUTE_AUTO_THRESHOLD", float),
         classifier_url=_env("classifier_url", "SCANNER_CLASSIFIER_URL"),
