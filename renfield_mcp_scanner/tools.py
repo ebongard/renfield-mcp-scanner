@@ -9,8 +9,14 @@ import time
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 
-from . import audit, button, classifier, sane, separator, usb
-from .config import Config, MissingTokenError
+from . import audit, blank, button, classifier, sane, separator, usb
+from .config import (
+    BLANK_BACKS_DROP,
+    BLANK_BACKS_MEASURE,
+    SIDES,
+    Config,
+    MissingTokenError,
+)
 from .contract import StageAction
 from .pusher import TargetPusher
 from .router import Routing, route
@@ -37,7 +43,10 @@ async def list_scanners(config: Config) -> dict:
         "ok": True, "device": device,
         "settings": {"source": config.source, "mode": config.mode,
                      "resolution": config.resolution,
-                     "page_height_mm": config.page_height_mm},
+                     "page_width_mm": config.page_width_mm,
+                     "page_height_mm": config.page_height_mm,
+                     "sides": sorted(SIDES),
+                     "blank_backs": config.blank_backs},
         "targets": [{"id": t.id, "label": t.label} for t in config.targets],
     }
 
@@ -281,19 +290,86 @@ async def _deliver(
             "stage_id": None if outcome.action is StageAction.DISCARD else stage_dir.name}
 
 
+def resolve_source(config: Config, sides: str = "") -> str | None:
+    """The SANE source for a request: empty = the configured one, otherwise
+    ``duplex`` / ``simplex``. ``None`` for anything else — never a guess."""
+    sides = (sides or "").strip().lower()
+    if not sides:
+        return config.source
+    return SIDES.get(sides)
+
+
+def invalid_sides(sides: str) -> dict:
+    return _err(f"unknown sides {sides!r}; allowed: {', '.join(sorted(SIDES))} "
+                "(or empty for the configured default)", "invalid_sides")
+
+
+def blank_rules(config: Config) -> blank.BlankRules:
+    return blank.BlankRules(
+        min_luminance=config.blank_min_luminance,
+        ink_level=config.blank_ink_level,
+        ink_chroma=config.blank_ink_chroma,
+        ink_floor_mm2=config.blank_ink_floor_mm2,
+        margin_mm=config.blank_margin_mm,
+        white_clip=config.white_clip,
+        dpi=float(config.resolution),
+        ocr_languages=config.ocr_languages,
+    )
+
+
+def _drop_blank_backs(config: Config, stage_dir: Path, pages: list[Path], *,
+                      source: str, job_id: str) -> tuple[list[Path], list]:
+    """Blocking: measure the back sides, set the blank ones aside. Runs in a
+    thread — it opens every back side at full resolution and may run OCR."""
+    try:
+        kept, verdicts = blank.select(pages, source=source, rules=blank_rules(config))
+    except Exception:  # a failed check keeps every page, never loses the scan
+        logger.exception("job %s stage %s: blank check failed — all pages kept",
+                         job_id or "-", stage_dir.name)
+        return list(pages), []
+    dropped = blank.set_aside(stage_dir, stage_dir / "pages", verdicts,
+                              job_id=job_id, total=len(pages))
+    return kept, dropped
+
+
+def _measure_blank_backs(config: Config, stage_dir: Path, pages: list[Path], *,
+                         source: str, job_id: str) -> None:
+    """Blocking, ``measure`` mode: log the verdicts, touch nothing. A failure
+    here costs the measurement only — the scan goes on unchanged."""
+    try:
+        verdicts = blank.measure(pages, source=source, rules=blank_rules(config))
+        blank.report_measured(stage_dir, verdicts, job_id=job_id, total=len(pages))
+    except Exception:  # measuring must never cost the scan
+        logger.exception("job %s stage %s: blank measurement failed — nothing changed",
+                         job_id or "-", stage_dir.name)
+
+
 async def scan_document(
     config: Config, staging, assemble, *, target: str = "", title: str = "",
+    sides: str = "", job_id: str = "",
 ) -> dict:
     """Scan the feeder, correct it, split at separator sheets, and route.
 
     ``assemble`` builds the searchable PDF from the corrected pages; it is
     injected so the whole flow is testable without a scanner or ocrmypdf.
+
+    ``sides`` picks ``duplex`` or ``simplex`` (``ADF Front``) for this one scan;
+    empty keeps the configured source.
     """
+    source = resolve_source(config, sides)
+    if source is None:
+        return invalid_sides(sides)
     routing = route(config, declared=target)
     # Route BEFORE scanning when a destination was declared, so an unknown
     # target id costs nothing.
     if routing.target is None and target:
         return _err(routing.reason, "unknown_target")
+    # Blank back sides are decided HERE, on front/back parity — which only
+    # holds when SANE skips nothing itself (see blank.py). Only `drop` changes
+    # the SANE call; `off` and `measure` scan exactly as before.
+    duplex = source == blank.DUPLEX_SOURCE
+    drop_blanks = config.blank_backs == BLANK_BACKS_DROP and duplex
+    measure_blanks = config.blank_backs == BLANK_BACKS_MEASURE and duplex
 
     try:
         device = await sane.find_device(config.device)
@@ -304,8 +380,9 @@ async def scan_document(
     try:
         result = await sane.scan_batch(
             device, stage_dir / "pages",
-            source=config.source, mode=config.mode, resolution=config.resolution,
-            page_height_mm=config.page_height_mm,
+            source=source, mode=config.mode, resolution=config.resolution,
+            page_height_mm=config.page_height_mm, page_width_mm=config.page_width_mm,
+            **({"skip_blank": 0.0} if drop_blanks else {}),
         )
     except sane.ScannerError as exc:
         staging.discard(stage_dir)
@@ -320,6 +397,28 @@ async def scan_document(
     if not result.pages:
         staging.discard(stage_dir)
         return _err("no pages scanned — is the feeder loaded?", "no_pages")
+
+    # 🛑 BEFORE segmentation, deliberately. (1) The decision rests on the
+    # front/back parity of the WHOLE scan; a segment can start on either side
+    # once a separator sheet sits in the stack. (2) A separator sheet's own
+    # blank back would otherwise open the next segment as its first page —
+    # `--swskip` used to drop it, and with it off this is what drops it now.
+    # (3) The classifier probe and the delivery both see the same, cleaned page
+    # list. The measurement still runs on the colour-corrected image, the same
+    # pixels the PDF gets (`pipeline.correct`, applied in memory here).
+    pages = result.pages
+    dropped: list = []
+    if drop_blanks:
+        pages, dropped = await asyncio.to_thread(
+            _drop_blank_backs, config, stage_dir, pages, source=source, job_id=job_id)
+    elif measure_blanks:
+        await asyncio.to_thread(
+            _measure_blank_backs, config, stage_dir, pages, source=source, job_id=job_id)
+
+    def _noted(out: dict) -> dict:
+        if dropped:
+            out["blank_backs_dropped"] = [v.page for v in dropped]
+        return out
 
     #: Eine im Klassifizierer-Zweig gebaute PDF, die die Lieferung
     #: wiederverwendet. `None` heisst „noch keine gebaut".
@@ -351,7 +450,7 @@ async def scan_document(
     #    Stapel, ohne dass jemand es merkt. Der Entwurf, der die Frage
     #    entschaerft: 1/3 versuchen, und nur wenn nichts dekodiert, die volle
     #    Aufloesung nachschieben. Details und Tabelle im README.
-    segments = await asyncio.to_thread(separator.segment, result.pages)
+    segments = await asyncio.to_thread(separator.segment, pages)
     used_separators = any(s.target_id for s in segments) or len(segments) > 1
 
     # SINGLE DOCUMENT — no separator sheets in the stack. Unchanged behaviour.
@@ -364,7 +463,7 @@ async def scan_document(
             # der Lieferung — die Sonden-PDF IST die Lieferung, sie wird also
             # weitergegeben statt weggeworfen.
             pdf_probe = await asyncio.to_thread(
-                assemble, result.pages, stage_dir, config, title=title)
+                assemble, pages, stage_dir, config, title=title)
             text = await asyncio.to_thread(classifier.extract_text, pdf_probe)
             guess = await classifier.classify(
                 text, config.targets,
@@ -389,25 +488,25 @@ async def scan_document(
                                      f"{guess.confidence:.2f}, below the "
                                      f"{config.route_auto_threshold:.2f} threshold: "
                                      f"{guess.evidence}"))
-                return {"ok": True, "routed": False, "pages": len(result.pages),
-                        "stage_id": stage_dir.name,
-                        "suggested_target": guess.target_id,
-                        "confidence": guess.confidence, "evidence": guess.evidence,
-                        "message": "Scan complete. The suggested destination was not "
-                                   "confident enough to file automatically; it is "
-                                   "waiting for a decision."}
+                return _noted({"ok": True, "routed": False, "pages": len(pages),
+                               "stage_id": stage_dir.name,
+                               "suggested_target": guess.target_id,
+                               "confidence": guess.confidence, "evidence": guess.evidence,
+                               "message": "Scan complete. The suggested destination was "
+                                          "not confident enough to file automatically; "
+                                          "it is waiting for a decision."})
         if not routing.settled:
             staging.keep(stage_dir, reason="unrouted", detail=routing.reason)
-            return {"ok": True, "routed": False, "pages": len(result.pages),
-                    "stage_id": stage_dir.name,
-                    "message": "Scan complete but the destination is not settled; "
-                               "it is waiting for a routing decision.",
-                    "reason": routing.reason}
+            return _noted({"ok": True, "routed": False, "pages": len(pages),
+                           "stage_id": stage_dir.name,
+                           "message": "Scan complete but the destination is not settled; "
+                                      "it is waiting for a routing decision.",
+                           "reason": routing.reason})
         audit.record(staging.root, stage=stage_dir.name, layer=routing.layer,
                      target=routing.target.id, confidence=routing.confidence)
-        return await _deliver(config, staging, assemble, stage_dir=stage_dir,
-                              pages=result.pages, target=routing.target, title=title,
-                              pdf_path=pdf_probe)
+        return _noted(await _deliver(config, staging, assemble, stage_dir=stage_dir,
+                                     pages=pages, target=routing.target, title=title,
+                                     pdf_path=pdf_probe))
 
     # MIXED STACK — a separator both marks the boundary AND names the target.
     # Splitting is unconditional; routing by sheet applies only when the
@@ -434,6 +533,10 @@ async def scan_document(
         sub = staging.new_stage()
         for page in seg.pages:
             page.rename(sub / "pages" / page.name)
+        # The evidence of a dropped back side travels with its front, so it
+        # lives exactly as long as the stage that delivers that document.
+        if dropped:
+            blank.move_evidence(stage_dir, sub, {p.name for p in seg.pages})
         documents.append(await _deliver(config, staging, assemble, stage_dir=sub,
                                         pages=sorted((sub / "pages").glob("p*.png")),
                                         target=seg_target, title=title))
@@ -444,10 +547,10 @@ async def scan_document(
     else:
         staging.discard(stage_dir)
 
-    return {"ok": all(d.get("ok") for d in documents) and not skipped,
-            "routed": True, "split": True,
-            "documents": documents, "skipped": skipped,
-            "segments": len(segments), "pages": len(result.pages)}
+    return _noted({"ok": all(d.get("ok") for d in documents) and not skipped,
+                   "routed": True, "split": True,
+                   "documents": documents, "skipped": skipped,
+                   "segments": len(segments), "pages": len(pages)})
 
 
 async def retry_pending_scans(config: Config, staging, stage_id: str = "") -> dict:

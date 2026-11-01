@@ -98,7 +98,8 @@ async def watcher_health() -> dict:
 
 
 @mcp.tool()
-async def scan_document(ctx: Context, target: str = "", title: str = "") -> dict:
+async def scan_document(ctx: Context, target: str = "", title: str = "",
+                        sides: str = "") -> dict:
     """START scanning every sheet in the document feeder into one searchable PDF
     and filing it into a single Renfield instance.
 
@@ -115,8 +116,17 @@ async def scan_document(ctx: Context, target: str = "", title: str = "") -> dict
     configured. With exactly one configured target it is chosen automatically.
     If the destination cannot be settled the scan is kept safely on the scanner
     host and waits for a routing decision — it is never filed into a guess.
+
+    `sides` is `simplex` for single-sided paper (front only) or `duplex` for
+    both sides; leave it empty for the scanner's configured default. In a
+    duplex scan, blank back sides are dropped only when the scanner host has
+    that switched on (`SCANNER_BLANK_BACKS=drop`; the default is off).
     """
-    return await _job_manager().start(caller=_caller(ctx), target=target, title=title)
+    config, _ = _ctx()
+    if t.resolve_source(config, sides) is None:
+        return t.invalid_sides(sides)
+    return await _job_manager().start(caller=_caller(ctx), target=target, title=title,
+                                      sides=sides)
 
 
 @mcp.tool()
@@ -244,8 +254,8 @@ async def _serve() -> None:
         logger.info("purged %d settled job record(s)", purged_jobs)
     _jobs = JobManager(
         store,
-        run_scan=lambda target, title: t.scan_document(
-            config, staging, assemble, target=target, title=title),
+        run_scan=lambda target, title, **kw: t.scan_document(
+            config, staging, assemble, target=target, title=title, **kw),
         notifier=JobEventNotifier(config),
         retention_days=config.staging_retention_days,
     )

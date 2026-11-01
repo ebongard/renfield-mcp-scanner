@@ -338,7 +338,8 @@ async def read_sensors(device: str) -> Sensors:
 
 async def scan_batch(
     device: str, out_dir: Path, *, source: str, mode: str, resolution: int,
-    page_height_mm: float, deskew: bool = False, crop: bool = False,
+    page_height_mm: float, page_width_mm: float | None = None,
+    deskew: bool = False, crop: bool = False,
     skip_blank: float = 2.0, timeout: float = 1800.0,
 ) -> ScanResult:
     """Scan the whole feeder into out_dir as p0001.png...
@@ -347,6 +348,15 @@ async def scan_batch(
 
     * ``page_height_mm`` is A4 (297), NOT SANE's US Letter default (279.364),
       which silently truncates 17.7mm off the bottom of every A4 page.
+    * ``page_width_mm`` (when given) sets the paper width. The fujitsu
+      backend's default is US Letter width (215.9 mm); sane-fujitsu(5) says
+      the scanner uses page-width "to determine centering of scan coordinates
+      when using the ADF", so A4 (210) narrows the window symmetrically around
+      the centred paper path instead of cutting one edge. ``None`` passes no
+      flag (the backend default).
+    * ``skip_blank`` is SANE's ``--swskip`` percentage; 0 disables it. The
+      caller sets 0 while ``blank.py`` decides on duplex parity, because a page
+      skipped inside the backend renumbers every page after it.
     * ``deskew`` is OFF. Scanner-side --swdeskew ESTIMATES the angle from page
       content and gets it badly wrong on a sparse back side (measured ~34
       degrees of rotation it invented). A crooked feed skews BOTH sides of a
@@ -365,6 +375,7 @@ async def scan_batch(
         status, log = await _run(
             "-d", device,
             "--source", source, "--mode", mode, "--resolution", str(resolution),
+            *(("--page-width", str(page_width_mm)) if page_width_mm is not None else ()),
             "--page-height", str(page_height_mm),
             "--swdeskew=yes" if deskew else "--swdeskew=no",
             "--swcrop=yes" if crop else "--swcrop=no",

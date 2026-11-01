@@ -76,7 +76,7 @@ async def test_store_round_trip_is_private(tmp_path):
 async def test_start_returns_before_the_scan_finishes(tmp_path):
     release = asyncio.Event()
 
-    async def run_scan(target, title):
+    async def run_scan(target, title, **_):
         await release.wait()
         return {"ok": True, "routed": True, "renfield_document_id": 613}
 
@@ -100,7 +100,7 @@ async def test_second_start_while_busy_names_the_running_job(tmp_path):
     release = asyncio.Event()
     calls = []
 
-    async def run_scan(target, title):
+    async def run_scan(target, title, **_):
         calls.append(1)
         await release.wait()
         return {"ok": True, "routed": True}
@@ -120,7 +120,7 @@ async def test_another_caller_learns_nothing_about_the_running_job(tmp_path):
     """Three instances share one scanner: xidra must not read household's scan."""
     release = asyncio.Event()
 
-    async def run_scan(target, title):
+    async def run_scan(target, title, **_):
         await release.wait()
         return {"ok": True, "routed": True, "renfield_document_id": 9}
 
@@ -188,7 +188,7 @@ async def test_feeder_is_released_before_the_event_is_sent(tmp_path):
         async def deliver(self, job, store):
             await event_gate.wait()
 
-    async def run_scan(target, title):
+    async def run_scan(target, title, **_):
         return {"ok": True, "routed": True}
 
     manager = j.JobManager(j.JobStore(tmp_path), run_scan, _SlowNotifier())
@@ -553,7 +553,7 @@ async def test_finished_jobs_are_cleaned_up_while_running_not_only_at_start(tmp_
     await store.save({"job_id": "2" * 32, "status": j.DONE, "finished_at": old,
                       "event": {"state": j.EVENT_RETRY}})
 
-    async def run_scan(target, title):
+    async def run_scan(target, title, **_):
         return {"ok": True, "routed": True}
 
     manager = j.JobManager(store, run_scan, _Notifier(), retention_days=30)
@@ -570,7 +570,7 @@ async def test_runtime_cleanup_is_off_without_a_retention(tmp_path):
     await store.save({"job_id": "1" * 32, "status": j.DONE, "finished_at": "2000-01-01T00:00:00",
                       "event": {"state": j.EVENT_DELIVERED}})
 
-    async def run_scan(target, title):
+    async def run_scan(target, title, **_):
         return {"ok": True, "routed": True}
 
     manager = j.JobManager(store, run_scan, _Notifier())

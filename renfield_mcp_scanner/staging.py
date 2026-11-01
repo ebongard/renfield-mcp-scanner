@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import shutil
 import uuid
 from datetime import datetime, timedelta
@@ -26,6 +27,14 @@ from pathlib import Path
 logger = logging.getLogger("renfield-mcp-scanner.staging")
 
 _META = "stage.json"
+
+#: Inside a stage: the blank back sides `blank.py` set aside.
+DROPPED_DIR = "dropped"
+#: Under the staging root: dropped back sides of stages that were already
+#: discarded (delivered). One sub-directory per stage, named after it. Swept by
+#: `purge_expired` with the same retention as the stages — a wrong drop stays
+#: recoverable after delivery, and private pages still do not sit here forever.
+RETAINED_DROPPED_DIR = "dropped-backs"
 
 #: Gründe, die auf eine ENTSCHEIDUNG warten — ein vorgesehener Zustand. Alles
 #: andere ist ein FEHLER-Stapel: ein abgebrochener Scan, eine abgelehnte oder
@@ -71,9 +80,45 @@ class Staging:
         logger.info("stage %s kept (%s)", stage.name, reason)
 
     def discard(self, stage: Path) -> None:
-        """Remove a stage. Only ever after an acknowledged terminal outcome."""
+        """Remove a stage. Only ever after an acknowledged terminal outcome.
+
+        🛑 The stage's dropped blank back sides are NOT removed with it: they
+        move to ``<root>/dropped-backs/<stage>/`` first and are swept there by
+        `purge_expired`. Delivery is exactly the moment a wrong drop becomes
+        visible (a page missing from the filed document) — deleting the
+        evidence then would make it unrecoverable at the first chance to notice.
+        """
+        retained = self._retain_dropped(stage)
         shutil.rmtree(stage, ignore_errors=True)
-        logger.info("stage %s discarded", stage.name)
+        if retained:
+            logger.info("stage %s discarded; %d dropped blank back side(s) retained "
+                        "in %s/%s until the retention sweep", stage.name, retained,
+                        RETAINED_DROPPED_DIR, stage.name)
+        else:
+            logger.info("stage %s discarded", stage.name)
+
+    def _retain_dropped(self, stage: Path) -> int:
+        """Move a stage's dropped pages out before the stage goes. Returns how
+        many page images were retained (0 when there were none)."""
+        src = stage / DROPPED_DIR
+        images = sorted(src.glob("*.png")) if src.is_dir() else []
+        if not images:
+            return 0
+        parent = self.root / RETAINED_DROPPED_DIR
+        parent.mkdir(exist_ok=True)
+        parent.chmod(0o700)
+        dest = parent / stage.name
+        try:
+            shutil.move(str(src), str(dest))
+        except OSError:
+            # Retention is evidence, not the delivery. The document is filed
+            # either way; say loudly that its dropped pages could not be kept.
+            logger.exception("stage %s: dropped blank back sides could not be "
+                             "retained — they go with the stage", stage.name)
+            return 0
+        # The retention clock starts at delivery, not at the scan.
+        os.utime(dest)
+        return len(images)
 
     def pending(self) -> list[dict]:
         """Jeder wartende Stapel — mit Grund, ALTER und der Angabe, ob er aus
@@ -176,6 +221,16 @@ class Staging:
             if datetime.fromtimestamp(stage.stat().st_mtime) < cutoff:
                 shutil.rmtree(stage, ignore_errors=True)
                 removed += 1
+        # Dropped blank back sides of delivered stages: same retention. Not
+        # counted as stages — the return value is what callers report as such.
+        swept = 0
+        for kept in (self.root / RETAINED_DROPPED_DIR).glob("scan-*"):
+            if datetime.fromtimestamp(kept.stat().st_mtime) < cutoff:
+                shutil.rmtree(kept, ignore_errors=True)
+                swept += 1
         if removed:
             logger.info("purged %d stage(s) older than %dd", removed, retention_days)
+        if swept:
+            logger.info("purged the dropped blank back sides of %d delivered stage(s) "
+                        "older than %dd", swept, retention_days)
         return removed

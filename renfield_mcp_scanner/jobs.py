@@ -519,7 +519,7 @@ class JobEventNotifier:
 
 class JobManager:
     def __init__(self, store: JobStore,
-                 run_scan: Callable[[str, str], Awaitable[dict]],
+                 run_scan: Callable[..., Awaitable[dict]],
                  notifier: JobEventNotifier,
                  *, retention_days: int = 0):
         self._store = store
@@ -537,7 +537,8 @@ class JobManager:
         self._tasks.add(task)
         task.add_done_callback(self._tasks.discard)
 
-    async def start(self, *, caller: str | None, target: str, title: str) -> dict:
+    async def start(self, *, caller: str | None, target: str, title: str,
+                    sides: str = "") -> dict:
         async with self._lock:
             if self._active is not None:
                 # `message`, not `error`: busy is an expected answer, and an
@@ -554,6 +555,7 @@ class JobManager:
             job = {
                 "job_id": uuid.uuid4().hex, "status": RUNNING,
                 "caller": caller, "target": target or "", "title": title or "",
+                "sides": sides or "",
                 "started_at": _now(), "finished_at": None, "result": None,
                 "event": {"state": EVENT_PENDING, "attempts": 0},
             }
@@ -567,7 +569,11 @@ class JobManager:
     async def _run(self, job: dict) -> None:
         try:
             try:
-                result = await self._run_scan(job["target"], job["title"])
+                # Keywords, so the job id reaches the scan's own log lines
+                # (blank-page evidence) and `sides` reaches the SANE source.
+                result = await self._run_scan(job["target"], job["title"],
+                                              sides=job.get("sides", ""),
+                                              job_id=job["job_id"])
                 status = outcome_status(result)
             except Exception as exc:  # noqa: BLE001 - a crash must still end the job
                 logger.exception("job %s crashed", job["job_id"])
