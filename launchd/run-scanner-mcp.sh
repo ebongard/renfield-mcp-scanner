@@ -33,6 +33,7 @@ export SCANNER_CALLER_TARGET_BUTTON="${SCANNER_CALLER_TARGET_BUTTON:-household}"
 # Ein Push-Token je Ziel. Ein fehlendes laesst NUR dieses Ziel ausfallen —
 # der Scanner meldet es beim Preflight namentlich, statt still zu scheitern.
 export SCANNER_TOKEN_XIDRA="$(kc SCANNER_TOKEN_XIDRA)"
+export SCANNER_TOKEN_MAMA="$(kc SCANNER_TOKEN_MAMA)"
 # L3 wird erst ab dem zweiten Ziel relevant: bei einem greift der Kurzschluss.
 export SCANNER_CLASSIFIER_URL="${SCANNER_CLASSIFIER_URL:-http://cuda.local:8081/v1}"
 export SCANNER_CLASSIFIER_MODEL="${SCANNER_CLASSIFIER_MODEL:-qwen3.6}"
