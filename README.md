@@ -24,7 +24,18 @@ change, never a code change. **`n = 1` short-circuits the whole routing layer** 
 no classifier, no separator sheets, no review queue.
 
 No tokens live in the registry: a target names the env var holding its token
-(`token_env`), resolved at push time.
+(`token_env`), resolved at push time. The launchd entrypoint reads those names
+from the registry and loads each from the Keychain, so adding a target never
+touches the script.
+
+A target is reached by the name people say. `aliases` lists those names
+("Haushalt", a person's name, a spelling with a hyphen); `scan_document` and
+`route_scan` resolve `target` against id, label and aliases (case, spaces,
+hyphens, apostrophes, a trailing "Renfield" and a possessive "s" are ignored).
+An exact id always wins; a name two targets answer to is refused. An unknown
+name is refused **before** the feeder runs, with every known name in the error.
+Keep the real names in your registry only — the agent hint in Renfield names
+none.
 
 ## Status
 

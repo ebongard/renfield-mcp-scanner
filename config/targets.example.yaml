@@ -18,6 +18,8 @@ targets:
       Correspondence addressed to the primary account holder.
     base_url: http://renfield-backend:8000
     token_env: SCANNER_TOKEN_PRIMARY
+    # Names a person says for this target; resolved by scan_document/route_scan.
+    aliases: [Primary, Main instance]
     scan_profile_id: default
     separator_payload: PRIMARY
 
@@ -26,5 +28,6 @@ targets:
   #   description: Correspondence addressed to the second account holder.
   #   base_url: http://other-backend:8000
   #   token_env: SCANNER_TOKEN_SECOND
+  #   aliases: [Second, second-instance]
   #   scan_profile_id: default
   #   separator_payload: SECOND

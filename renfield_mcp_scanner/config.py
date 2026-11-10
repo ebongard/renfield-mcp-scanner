@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 from pathlib import Path
 from typing import Literal
 
@@ -62,6 +63,10 @@ class ScanTarget(BaseModel):
     # fails with CERTIFICATE_VERIFY_FAILED even though the URL works in a shell.
     # Empty = the default trust store. Never disable verification instead.
     ca_bundle: str = ""
+    # The names people SAY for this target ("Haushalt", a person's name, a
+    # spelling with a hyphen). They live here, in the operator's private file,
+    # so no repo has to name a target for an agent to reach it.
+    aliases: list[str] = Field(default_factory=list)
 
     def token(self) -> str:
         value = os.environ.get(self.token_env, "").strip()
@@ -216,10 +221,49 @@ class Config(BaseModel):
     def target_by_id(self, target_id: str) -> ScanTarget | None:
         return next((t for t in self.targets if t.id == target_id), None)
 
+    def resolve_target(self, spoken: str) -> tuple[ScanTarget | None, str]:
+        """Map what a person said to ONE target, or explain why not.
+
+        An exact id wins first, so every caller that already passes an id is
+        unaffected. Then id, label and aliases are compared loosely (case,
+        spaces, hyphens, apostrophes, a trailing "Renfield", a possessive "s").
+        Two targets matching at the same looseness is refused, never guessed:
+        a wrong match files paper into someone else's instance.
+        """
+        exact = self.target_by_id(spoken)
+        if exact is not None:
+            return exact, ""
+        names = {t.id: {_loose(n) for n in (t.id, t.label, *t.aliases)} for t in self.targets}
+        for key in _loose_variants(spoken):
+            hits = [t for t in self.targets if key in names[t.id]]
+            if len(hits) == 1:
+                return hits[0], ""
+            if len(hits) > 1:
+                return None, (f"target {spoken!r} is ambiguous "
+                              f"({', '.join(t.id for t in hits)}); known: {self.known_targets()}")
+        return None, f"unknown target {spoken!r}; known: {self.known_targets()}"
+
+    def known_targets(self) -> list[str]:
+        """Every name a target can be reached by, for an error an agent can act on."""
+        return [n for t in self.targets for n in dict.fromkeys((t.id, t.label, *t.aliases))]
+
     @property
     def single_target(self) -> ScanTarget | None:
         """n == 1 short-circuits the whole routing layer."""
         return self.targets[0] if len(self.targets) == 1 else None
+
+
+def _loose(name: str) -> str:
+    return re.sub(r"[\s\-_'\u2019`]+", "", name.casefold())
+
+
+def _loose_variants(spoken: str) -> list[str]:
+    """The query, then without a trailing "renfield", then without a possessive "s"."""
+    out = [_loose(spoken)]
+    out.append(out[0].removesuffix("renfield"))
+    if out[1].endswith("s"):
+        out.append(out[1][:-1])
+    return [v for v in dict.fromkeys(out) if v]
 
 
 def load_targets(path: str | Path) -> list[ScanTarget]:

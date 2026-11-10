@@ -113,7 +113,10 @@ async def scan_document(ctx: Context, target: str = "", title: str = "",
     is one feeder; do not retry.
 
     Pass `target` to name the destination instance when more than one is
-    configured. With exactly one configured target it is chosen automatically.
+    configured — the name as the user said it is fine; it is resolved here, and
+    an unknown name is refused before any paper is pulled in, with the names
+    that are known. With exactly one configured target it is chosen
+    automatically.
     If the destination cannot be settled the scan is kept safely on the scanner
     host and waits for a routing decision — it is never filed into a guess.
 
@@ -125,7 +128,10 @@ async def scan_document(ctx: Context, target: str = "", title: str = "",
     config, _ = _ctx()
     if t.resolve_source(config, sides) is None:
         return t.invalid_sides(sides)
-    return await _job_manager().start(caller=_caller(ctx), target=target, title=title,
+    target_id, refused = t.check_target(config, target)
+    if refused is not None:
+        return refused
+    return await _job_manager().start(caller=_caller(ctx), target=target_id, title=title,
                                       sides=sides)
 
 
@@ -160,6 +166,9 @@ async def list_pending_scans() -> dict:
 @mcp.tool()
 async def route_scan(stage_id: str, target: str) -> dict:
     """Decide where a waiting scan belongs and file it there.
+
+    `target` may be the name as the user said it; an unknown name is refused
+    with the names that are known.
 
     Use this for scans reported by `list_pending_scans` that have no
     destination — either nothing named one, or the suggestion was not confident

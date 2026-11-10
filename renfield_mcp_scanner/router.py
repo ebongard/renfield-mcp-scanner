@@ -38,13 +38,11 @@ class Routing:
 def route(config: Config, declared: str = "") -> Routing:
     """Resolve a destination, or return an UNSETTLED routing for human review."""
     if declared:
-        target = config.target_by_id(declared)
+        target, why = config.resolve_target(declared)
         if target is None:
-            known = [t.id for t in config.targets]
-            # An unknown id is refused rather than coerced: a typo must not
-            # become a silent route into the wrong instance.
-            return Routing(None, "undecided", 0.0,
-                           f"unknown target {declared!r}; known: {known}")
+            # An unknown or ambiguous name is refused rather than coerced: a
+            # typo must not become a silent route into the wrong instance.
+            return Routing(None, "undecided", 0.0, why)
         return Routing(target, "declared", 1.0, "operator declared the destination")
 
     single = config.single_target

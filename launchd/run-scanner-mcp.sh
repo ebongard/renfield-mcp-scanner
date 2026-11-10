@@ -32,8 +32,24 @@ export SCANNER_CALLER_TARGET_XIDRA="${SCANNER_CALLER_TARGET_XIDRA:-xidra}"
 export SCANNER_CALLER_TARGET_BUTTON="${SCANNER_CALLER_TARGET_BUTTON:-household}"
 # Ein Push-Token je Ziel. Ein fehlendes laesst NUR dieses Ziel ausfallen —
 # der Scanner meldet es beim Preflight namentlich, statt still zu scheitern.
-export SCANNER_TOKEN_XIDRA="$(kc SCANNER_TOKEN_XIDRA)"
-export SCANNER_TOKEN_MAMA="$(kc SCANNER_TOKEN_MAMA)"
+# Die Namen stehen als `token_env` in targets.yaml und werden von dort gelesen:
+# ein neues Ziel ist dann reine Konfiguration, und dieses (oeffentliche) Skript
+# nennt kein einziges. Nur GROSSBUCHSTABEN-Namen werden exportiert.
+# Erst in eine Variable: scheitert das Lesen, bricht `set -e` hier ab — in einer
+# Prozess-Substitution liefe der Server still ohne Ziel-Token weiter.
+token_names="$("$HERE/.venv/bin/python" -I -c '
+import sys, yaml
+with open(sys.argv[1]) as f:
+    data = yaml.safe_load(f) or {}
+for t in data.get("targets") or []:
+    if isinstance(t, dict) and t.get("token_env"):
+        print(t["token_env"])
+' "$SCANNER_TARGETS_YAML")"
+while IFS= read -r token_name; do
+  [ -n "$token_name" ] || continue
+  [[ "$token_name" =~ ^[A-Z][A-Z0-9_]*$ ]] || { printf "skipping token_env %q\n" "$token_name" >&2; continue; }
+  export "$token_name=$(kc "$token_name")"
+done <<< "$token_names"
 # L3 wird erst ab dem zweiten Ziel relevant: bei einem greift der Kurzschluss.
 export SCANNER_CLASSIFIER_URL="${SCANNER_CLASSIFIER_URL:-http://cuda.local:8081/v1}"
 export SCANNER_CLASSIFIER_MODEL="${SCANNER_CLASSIFIER_MODEL:-qwen3.6}"
