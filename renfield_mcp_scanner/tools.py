@@ -299,6 +299,20 @@ def resolve_source(config: Config, sides: str = "") -> str | None:
     return SIDES.get(sides)
 
 
+def check_target(config: Config, target: str) -> tuple[str, dict | None]:
+    """Settle a declared target BEFORE paper is pulled in.
+
+    Returns the canonical id (empty when none was named), or the refusal to
+    hand back. Without this an unknown target only surfaced in the completion
+    event, after the feeder had already been emptied."""
+    if not target:
+        return "", None
+    chosen, why = config.resolve_target(target)
+    if chosen is None:
+        return "", _err(why, "unknown_target")
+    return chosen.id, None
+
+
 def invalid_sides(sides: str) -> dict:
     return _err(f"unknown sides {sides!r}; allowed: {', '.join(sorted(SIDES))} "
                 "(or empty for the configured default)", "invalid_sides")
@@ -625,9 +639,9 @@ async def route_scan(config: Config, staging, assemble, stage_id: str, target: s
     confident enough about, ends here — where a person decides. Nothing is ever
     filed on a guess, so this path must always exist and always work.
     """
-    chosen = config.target_by_id(target)
+    chosen, why = config.resolve_target(target)
     if chosen is None:
-        return _err(f"unknown target {target!r}; known: {[t.id for t in config.targets]}")
+        return _err(why, "unknown_target")
 
     stage = staging.root / stage_id
     if not stage.exists():
@@ -637,7 +651,7 @@ async def route_scan(config: Config, staging, assemble, stage_id: str, target: s
     pages = sorted((stage / "pages").glob("p*.png"))
     if not pdfs and not pages:
         return _err(f"stage {stage_id!r} holds neither pages nor a PDF")
-    audit.record(staging.root, stage=stage_id, layer="human", target=target)
+    audit.record(staging.root, stage=stage_id, layer="human", target=chosen.id)
     # 🛑 Hier stand ein `if not pdfs: assemble(...)` davor, waehrend `_deliver`
     # danach bedingungslos erneut baute — der bedingte Aufruf war wirkungslos
     # und kostete einen vollen OCR-Durchlauf. Jetzt baut `_deliver` genau

@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 from pathlib import Path
 from typing import Literal
 
@@ -62,6 +63,10 @@ class ScanTarget(BaseModel):
     # fails with CERTIFICATE_VERIFY_FAILED even though the URL works in a shell.
     # Empty = the default trust store. Never disable verification instead.
     ca_bundle: str = ""
+    # The names people SAY for this target ("Haushalt", a person's name, a
+    # spelling with a hyphen). They live here, in the operator's private file,
+    # so no repo has to name a target for an agent to reach it.
+    aliases: list[str] = Field(default_factory=list)
 
     def token(self) -> str:
         value = os.environ.get(self.token_env, "").strip()
@@ -216,10 +221,46 @@ class Config(BaseModel):
     def target_by_id(self, target_id: str) -> ScanTarget | None:
         return next((t for t in self.targets if t.id == target_id), None)
 
+    def resolve_target(self, spoken: str) -> tuple[ScanTarget | None, str]:
+        """Map what a person said to ONE target, or explain why not.
+
+        An id wins first (exactly, then ignoring case), so every caller that
+        passes an id is unaffected. Then id, label and aliases are compared
+        ignoring case, spaces, hyphens and apostrophes -- and nothing looser.
+        🛑 No suffix is stripped: a fallback from "Andreas" to "Andrea" files
+        one person's paper into another person's instance with full
+        confidence. A form people actually say ("Omas Renfield") is listed as
+        an alias instead. Two targets answering to one name is refused.
+        """
+        exact = self.target_by_id(spoken) or next(
+            (t for t in self.targets if t.id.casefold() == spoken.casefold()), None)
+        if exact is not None:
+            return exact, ""
+        key = _loose(spoken)
+        hits = [t for t in self.targets
+                if key and key in {_loose(n) for n in (t.id, t.label, *t.aliases)}]
+        if len(hits) == 1:
+            return hits[0], ""
+        if len(hits) > 1:
+            return None, (f"target {spoken!r} is ambiguous "
+                          f"({', '.join(t.id for t in hits)}); known: {self.known_targets()}")
+        return None, f"unknown target {spoken!r}; known: {self.known_targets()}"
+
+    def known_targets(self) -> list[str]:
+        """Ids and labels -- what `list_scanners` already shows every caller.
+
+        Aliases stay out: they are the names of people, and the error goes to
+        whichever instance called, not only to the one the alias belongs to."""
+        return [f"{t.id} ({t.label})" for t in self.targets]
+
     @property
     def single_target(self) -> ScanTarget | None:
         """n == 1 short-circuits the whole routing layer."""
         return self.targets[0] if len(self.targets) == 1 else None
+
+
+def _loose(name: str) -> str:
+    return re.sub(r"[\s\-_'\u2019`]+", "", name.casefold())
 
 
 def load_targets(path: str | Path) -> list[ScanTarget]:
