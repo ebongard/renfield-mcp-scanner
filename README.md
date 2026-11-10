@@ -31,9 +31,11 @@ touches the script.
 A target is reached by the name people say. `aliases` lists those names
 ("Haushalt", a person's name, a spelling with a hyphen); `scan_document` and
 `route_scan` resolve `target` against id, label and aliases (case, spaces,
-hyphens, apostrophes, a trailing "Renfield" and a possessive "s" are ignored).
-An exact id always wins; a name two targets answer to is refused. An unknown
-name is refused **before** the feeder runs, with every known name in the error.
+hyphens and apostrophes are ignored, nothing more: list a possessive form such
+as "Omas Renfield" as its own alias). An id always wins; a name two targets
+answer to is refused. An unknown name is refused **before** the feeder runs;
+the error lists ids and labels, never aliases. `token_env` names must start
+with `SCANNER_TOKEN_`.
 Keep the real names in your registry only — the agent hint in Renfield names
 none.
 

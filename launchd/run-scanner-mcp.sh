@@ -34,7 +34,8 @@ export SCANNER_CALLER_TARGET_BUTTON="${SCANNER_CALLER_TARGET_BUTTON:-household}"
 # der Scanner meldet es beim Preflight namentlich, statt still zu scheitern.
 # Die Namen stehen als `token_env` in targets.yaml und werden von dort gelesen:
 # ein neues Ziel ist dann reine Konfiguration, und dieses (oeffentliche) Skript
-# nennt kein einziges. Nur GROSSBUCHSTABEN-Namen werden exportiert.
+# nennt kein einziges. Nur Namen mit `SCANNER_TOKEN_` werden exportiert: ein
+# Tippfehler wie `token_env: PATH` darf keine Variable dieses Skripts ueberschreiben.
 # Erst in eine Variable: scheitert das Lesen, bricht `set -e` hier ab — in einer
 # Prozess-Substitution liefe der Server still ohne Ziel-Token weiter.
 token_names="$("$HERE/.venv/bin/python" -I -c '
@@ -47,7 +48,7 @@ for t in data.get("targets") or []:
 ' "$SCANNER_TARGETS_YAML")"
 while IFS= read -r token_name; do
   [ -n "$token_name" ] || continue
-  [[ "$token_name" =~ ^[A-Z][A-Z0-9_]*$ ]] || { printf "skipping token_env %q\n" "$token_name" >&2; continue; }
+  [[ "$token_name" =~ ^SCANNER_TOKEN_[A-Z0-9_]+$ ]] || { printf "skipping token_env %q\n" "$token_name" >&2; continue; }
   export "$token_name=$(kc "$token_name")"
 done <<< "$token_names"
 # L3 wird erst ab dem zweiten Ziel relevant: bei einem greift der Kurzschluss.

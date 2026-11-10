@@ -44,19 +44,32 @@ def _cfg():
     ("Office-Instance", "office"),    # the label, with any spacing
     ("Oma", "granny"),
     ("omas renfield", "granny"),      # the alias as said, any case
-    ("Omas", "granny"),               # possessive
-    ("Granny's Renfield", "granny"),  # apostrophe + trailing "Renfield"
+    ("Omas-Renfield", "granny"),      # ...and any spacing
+    ("GRANNY", "granny"),             # an id ignoring case
 ])
 def test_spoken_names_resolve(spoken, expected):
     target, why = _cfg().resolve_target(spoken)
     assert target is not None and target.id == expected, why
 
 
-def test_an_unknown_name_is_refused_with_every_known_name():
+def test_an_unknown_name_is_refused_with_ids_and_labels_but_no_alias():
+    """The error goes to whichever instance called; aliases are people's names."""
     target, why = _cfg().resolve_target("Nachbar")
     assert target is None
-    for name in ("home", "Daheim", "office", "Office instance", "granny", "Oma"):
+    for name in ("home", "office", "Office instance", "granny", "Granny"):
         assert name in why
+    for alias in ("Daheim", "Oma", "Omas Renfield"):
+        assert alias not in why
+
+
+@pytest.mark.parametrize("spoken", ["Andreas", "Andreas Renfield", "Omas", "Granny's"])
+def test_no_suffix_is_stripped(spoken):
+    """🛑 A loose fallback is a wrong-instance route at full confidence:
+    "Andreas" must never reach the target whose alias is "Andrea"."""
+    cfg = Config(targets=[_t("home", "Home", ["Andrea", "Oma"]), _t("granny", "Granny", [])],
+                 staging_dir="/tmp/x")
+    target, why = cfg.resolve_target(spoken)
+    assert target is None and "unknown target" in why
 
 
 def test_two_targets_answering_to_one_name_is_refused_not_guessed():
@@ -70,6 +83,7 @@ def test_an_exact_id_wins_over_an_alias_of_another_target():
     cfg = Config(targets=[_t("oma", "Oma", []), _t("granny", "Granny", ["oma"])],
                  staging_dir="/tmp/x")
     assert cfg.resolve_target("oma")[0].id == "oma"
+    assert cfg.resolve_target("Oma")[0].id == "oma"   # case does not demote the id
 
 
 def test_a_registry_without_aliases_still_loads():
@@ -104,7 +118,7 @@ def jobs(monkeypatch):
 async def test_scan_document_refuses_an_unknown_target_before_the_feeder_runs(jobs):
     out = await server.scan_document(None, target="Nachbar")
     assert out["ok"] is False and out["error_code"] == "unknown_target"
-    assert "Oma" in out["error"]
+    assert "granny" in out["error"] and "Oma" not in out["error"]
     jobs.start.assert_not_awaited()
 
 
@@ -139,19 +153,20 @@ def entrypoint(tmp_path):
     python = root / ".venv" / "bin" / "python"
     python.write_text(f'#!/bin/sh\nexec "{sys.executable}" "$@"\n')
     server_stub = root / ".venv" / "bin" / "renfield-mcp-scanner"
-    server_stub.write_text("#!/bin/sh\nenv | grep -E '^(SCANNER_TOKEN_|TOK_)' | sort\n")
+    server_stub.write_text("#!/bin/sh\nenv | grep -E '^(SCANNER_TOKEN_|PATHX|TOK_)' | sort\n")
     security = fakebin / "security"
-    # Every secret exists except TOK_MISSING; reads only ever ask with `-s <name> -w`.
+    # Every secret exists except SCANNER_TOKEN_MISSING; reads only ever ask with `-s <name> -w`.
     security.write_text(
         "#!/bin/sh\nwhile [ $# -gt 0 ]; do [ \"$1\" = -s ] && n=$2; shift; done\n"
-        "[ \"$n\" = TOK_MISSING ] && exit 44\necho \"secret-of-$n\"\n")
+        "[ \"$n\" = SCANNER_TOKEN_MISSING ] && exit 44\necho \"secret-of-$n\"\n")
     for f in (python, server_stub, security):
         f.chmod(0o755)
     (root / "targets.yaml").write_text(
         "targets:\n"
-        "  - {id: a, label: A, base_url: x, scan_profile_id: d, token_env: TOK_ALPHA}\n"
-        "  - {id: b, label: B, base_url: x, scan_profile_id: d, token_env: TOK_MISSING}\n"
-        "  - {id: c, label: C, base_url: x, scan_profile_id: d, token_env: 'lower;id'}\n")
+        "  - {id: a, label: A, base_url: x, scan_profile_id: d, token_env: SCANNER_TOKEN_ALPHA}\n"
+        "  - {id: b, label: B, base_url: x, scan_profile_id: d, token_env: SCANNER_TOKEN_MISSING}\n"
+        "  - {id: c, label: C, base_url: x, scan_profile_id: d, token_env: 'lower;id'}\n"
+        "  - {id: d, label: D, base_url: x, scan_profile_id: d, token_env: TOK_OTHER}\n")
     return root
 
 
@@ -165,10 +180,10 @@ def _run(root):
 def test_every_token_named_in_the_registry_is_loaded(entrypoint):
     out = _run(entrypoint)
     assert out.returncode == 0, out.stderr
-    assert "TOK_ALPHA=secret-of-TOK_ALPHA" in out.stdout
+    assert "SCANNER_TOKEN_ALPHA=secret-of-SCANNER_TOKEN_ALPHA" in out.stdout
     # A missing Keychain entry disables only that target (empty, not absent),
     # exactly as the per-name lines did; the preflight names it.
-    assert "TOK_MISSING=\n" in out.stdout
+    assert "SCANNER_TOKEN_MISSING=\n" in out.stdout
 
 
 @pytest.mark.skipif(shutil.which("bash") is None, reason="needs bash")
@@ -177,14 +192,16 @@ def test_an_unreadable_registry_stops_the_start(entrypoint):
     (entrypoint / "targets.yaml").write_text("targets: [unclosed\n")
     out = _run(entrypoint)
     assert out.returncode != 0
-    assert "TOK_" not in out.stdout
+    assert "SCANNER_TOKEN_ALPHA" not in out.stdout
 
 
 @pytest.mark.skipif(shutil.which("bash") is None, reason="needs bash")
 def test_a_malformed_token_name_is_never_exported(entrypoint):
     out = _run(entrypoint)
     assert "lower" not in out.stdout
-    assert "skipping token_env" in out.stderr
+    # Upper case but without the prefix: could name PATH or HERE by mistake.
+    assert "TOK_OTHER" not in out.stdout
+    assert out.stderr.count("skipping token_env") == 2
 
 
 def test_the_entrypoint_names_no_target():

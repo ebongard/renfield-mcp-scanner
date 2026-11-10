@@ -224,28 +224,34 @@ class Config(BaseModel):
     def resolve_target(self, spoken: str) -> tuple[ScanTarget | None, str]:
         """Map what a person said to ONE target, or explain why not.
 
-        An exact id wins first, so every caller that already passes an id is
-        unaffected. Then id, label and aliases are compared loosely (case,
-        spaces, hyphens, apostrophes, a trailing "Renfield", a possessive "s").
-        Two targets matching at the same looseness is refused, never guessed:
-        a wrong match files paper into someone else's instance.
+        An id wins first (exactly, then ignoring case), so every caller that
+        passes an id is unaffected. Then id, label and aliases are compared
+        ignoring case, spaces, hyphens and apostrophes -- and nothing looser.
+        🛑 No suffix is stripped: a fallback from "Andreas" to "Andrea" files
+        one person's paper into another person's instance with full
+        confidence. A form people actually say ("Omas Renfield") is listed as
+        an alias instead. Two targets answering to one name is refused.
         """
-        exact = self.target_by_id(spoken)
+        exact = self.target_by_id(spoken) or next(
+            (t for t in self.targets if t.id.casefold() == spoken.casefold()), None)
         if exact is not None:
             return exact, ""
-        names = {t.id: {_loose(n) for n in (t.id, t.label, *t.aliases)} for t in self.targets}
-        for key in _loose_variants(spoken):
-            hits = [t for t in self.targets if key in names[t.id]]
-            if len(hits) == 1:
-                return hits[0], ""
-            if len(hits) > 1:
-                return None, (f"target {spoken!r} is ambiguous "
-                              f"({', '.join(t.id for t in hits)}); known: {self.known_targets()}")
+        key = _loose(spoken)
+        hits = [t for t in self.targets
+                if key and key in {_loose(n) for n in (t.id, t.label, *t.aliases)}]
+        if len(hits) == 1:
+            return hits[0], ""
+        if len(hits) > 1:
+            return None, (f"target {spoken!r} is ambiguous "
+                          f"({', '.join(t.id for t in hits)}); known: {self.known_targets()}")
         return None, f"unknown target {spoken!r}; known: {self.known_targets()}"
 
     def known_targets(self) -> list[str]:
-        """Every name a target can be reached by, for an error an agent can act on."""
-        return [n for t in self.targets for n in dict.fromkeys((t.id, t.label, *t.aliases))]
+        """Ids and labels -- what `list_scanners` already shows every caller.
+
+        Aliases stay out: they are the names of people, and the error goes to
+        whichever instance called, not only to the one the alias belongs to."""
+        return [f"{t.id} ({t.label})" for t in self.targets]
 
     @property
     def single_target(self) -> ScanTarget | None:
@@ -255,15 +261,6 @@ class Config(BaseModel):
 
 def _loose(name: str) -> str:
     return re.sub(r"[\s\-_'\u2019`]+", "", name.casefold())
-
-
-def _loose_variants(spoken: str) -> list[str]:
-    """The query, then without a trailing "renfield", then without a possessive "s"."""
-    out = [_loose(spoken)]
-    out.append(out[0].removesuffix("renfield"))
-    if out[1].endswith("s"):
-        out.append(out[1][:-1])
-    return [v for v in dict.fromkeys(out) if v]
 
 
 def load_targets(path: str | Path) -> list[ScanTarget]:
